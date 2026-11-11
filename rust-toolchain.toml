@@ -1,0 +1,5 @@
+# Pinned Rust toolchain: rustup switches to it inside this directory (and installs it when missing)
+[toolchain]
+channel = "1.99.1"
+components = ["clippy", "rustfmt"]
+targets = ["x86_64-unknown-linux-musl"]

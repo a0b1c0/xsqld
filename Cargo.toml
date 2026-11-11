@@ -1,0 +1,48 @@
+[package]
+name = "xsqld"
+version = "0.1.0"
+authors = ["HM"]
+edition = "2024"
+rust-version = "1.99"
+description = "Local-only SQLite database server speaking the sqld Hrana-over-HTTP subset, with group commit and a single write channel"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[[bin]]
+name = "xsqld"
+path = "src/main.rs"
+
+[dependencies]
+# mimalloc for both Rust and SQLite: musl's own allocator kept growing under the soak load (README §3)
+mimalloc = { version = "0.1.52", default-features = false }
+libmimalloc-sys = { version = "0.1.49", features = ["extended"] }
+anyhow = "1.0.104"
+axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio", "json", "query"] }
+base64 = "0.22.1"
+bytes = "1"
+clap = { version = "4.6", features = ["derive"] }
+futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
+getrandom = "0.4"
+http-body-util = "0.1.3"
+hyper = { version = "1", features = ["client", "http1", "server"] }
+hyper-util = { version = "0.1.21", features = ["http1", "server", "server-graceful", "service", "tokio"] }
+parking_lot = "0.12.5"
+# Stock SQLite (bundled: compiled from the latest source); column_decltype for declared column types; hooks for WAL
+# frame counts (checkpoint timing) and the authorizer; limits for the value size cap and no ATTACH; backup for the
+# /dump snapshot
+rusqlite = { version = "0.41.1", features = ["backup", "bundled", "column_decltype", "hooks", "limits"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+tokio = { version = "1.54", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal", "io-util"] }
+tokio-stream = "0.1"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"
+tower = { version = "0.5", features = ["util"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

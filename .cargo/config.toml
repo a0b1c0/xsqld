@@ -1,0 +1,6 @@
+# Extra compile flags for the bundled SQLite (read by the libsqlite3-sys build script).
+# HAVE_FDATASYNC: without it SQLite syncs with fsync() on Linux, which also flushes the inode's timestamps through the
+# file system journal on every commit. With synchronous=FULL that is one journal commit per group; fdatasync() of a
+# WAL frame written over already allocated blocks skips it. build.rs refuses to build for Linux without this flag.
+[env]
+LIBSQLITE3_FLAGS = "-DHAVE_FDATASYNC=1"
