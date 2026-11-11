@@ -208,10 +208,10 @@ impl<'c> Exec<'c> {
     }
 
     /// Syntax errors only: other prepare errors may depend on earlier steps (a table the batch creates). The
-    /// prepared statement stays in the cache for the real run.
+    /// prepared statement stays in the cache for the real run (long statements are not cached and compile again).
     fn syntax_error(&self, stmt: &proto::Stmt) -> Option<proto::Error> {
         let text = stmt.sql.as_deref()?;
-        let e = self.conn.c.prepare_cached(text).err()?;
+        let e = self.conn.prepare(text).err()?;
         let e = sql::prepare_error(&e, text);
         (e.code == "SQL_PARSE_ERROR").then_some(e)
     }
@@ -239,8 +239,7 @@ impl<'c> Exec<'c> {
     ) -> Result<StmtResult, proto::Error> {
         let mut st = self
             .conn
-            .c
-            .prepare_cached(sql_text)
+            .prepare(sql_text)
             .map_err(|e| sql::prepare_error(&e, sql_text))?;
         bind(&mut st, stmt)?;
         if self.grouped {

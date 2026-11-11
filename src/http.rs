@@ -105,14 +105,16 @@ pub async fn serve(
 
 #[derive(Clone)]
 struct Limits {
+    cfg: Arc<crate::config::Config>,
     requests: Arc<tokio::sync::Semaphore>,
     body_timeout: Duration,
     max_body: usize,
 }
 
 impl Limits {
-    fn new(cfg: &crate::config::Config, max_body: usize) -> Self {
+    fn new(cfg: &Arc<crate::config::Config>, max_body: usize) -> Self {
         Self {
+            cfg: cfg.clone(),
             requests: Arc::new(tokio::sync::Semaphore::new(cfg.max_concurrent_requests)),
             body_timeout: cfg.body_read_timeout(),
             max_body,
@@ -124,11 +126,14 @@ impl Limits {
 #[derive(Clone, Copy)]
 struct Arrived(Instant);
 
-/// Every request: at most `--max-concurrent-requests` at once (more get 503 at once; `/health` is always answered,
-/// the watchdog must not take an overloaded server for a dead one), and the whole body within
-/// `--body-read-timeout-ms` (408 otherwise)
+/// Every request: none for a Host that is not a local name and none from a web page (403, see [`refused`]), at most
+/// `--max-concurrent-requests` at once (more get 503 at once; `/health` is always answered, the watchdog must not take
+/// an overloaded server for a dead one), and the whole body within `--body-read-timeout-ms` (408 otherwise)
 async fn guard(State(limits): State<Limits>, req: axum::extract::Request, next: axum::middleware::Next) -> Response {
     let arrived = Instant::now();
+    if let Some(why) = refused(&limits.cfg, req.headers()) {
+        return error(StatusCode::FORBIDDEN, why);
+    }
     let _permit = if req.uri().path() == "/health" {
         None
     } else {
@@ -156,6 +161,31 @@ async fn guard(State(limits): State<Limits>, req: axum::extract::Request, next: 
     parts.extensions.insert(Arrived(arrived));
     next.run(axum::extract::Request::from_parts(parts, Body::from(body)))
         .await
+}
+
+/// Why a request is not answered, if it is not. The server has no authentication and picks the database by the Host
+/// header, so a web page open on this machine must not get through:
+/// - after DNS rebinding the page talks to this server as its own origin, and a same-origin GET carries no header
+///   that gives a browser away; but its Host is the page's domain, which is not a local name
+///   (`--allowed-host-suffixes`);
+/// - a page can send a cross-site request to a local name (`http://tenant.localhost:8080`), a "simple" POST
+///   (`text/plain`, no preflight) included; browsers mark those with `Origin` (every POST) and `Sec-Fetch-Site`.
+///
+/// Local clients send neither header. `Sec-Fetch-Mode` alone says nothing: Node's `fetch` sends it on every request.
+fn refused(cfg: &crate::config::Config, headers: &HeaderMap) -> Option<String> {
+    if let Some(host) = headers.get(header::HOST) {
+        match host.to_str() {
+            Ok(h) if cfg.host_allowed(h) => {}
+            _ => {
+                return Some(format!(
+                    "Host `{}` is not accepted (see --allowed-host-suffixes)",
+                    String::from_utf8_lossy(host.as_bytes())
+                ));
+            }
+        }
+    }
+    (headers.contains_key(header::ORIGIN) || headers.contains_key("sec-fetch-site"))
+        .then(|| "Requests from web browsers are not accepted".to_owned())
 }
 
 /// 200 like sqld (whose body is empty; clients look at the status only), plus what is running
@@ -579,15 +609,13 @@ fn dump_host_header(host: &str, port: u16) -> String {
     if port == 80 { host } else { format!("{host}:{port}") }
 }
 
-type DumpRx = tokio::sync::mpsc::Receiver<io::Result<Bytes>>;
-
 /// Downloads the dump: response head within [`DUMP_URL_HEAD_TIMEOUT`], no gap between chunks longer than
 /// [`DUMP_URL_IDLE_TIMEOUT`], all of it within `total`
 async fn fetch_dump(
     url: &str,
     allow_remote: bool,
     total: Duration,
-) -> Result<(DumpRx, tokio::task::JoinHandle<()>), (StatusCode, String)> {
+) -> Result<(crate::db::DumpRx, tokio::task::JoinHandle<()>), (StatusCode, String)> {
     let until = tokio::time::Instant::now() + total;
     let (host, port, path) = parse_http_url(url)?;
     let addrs: Vec<std::net::SocketAddr> = match host.parse::<IpAddr>() {
@@ -646,7 +674,12 @@ async fn fetch_dump(
             let idle = tokio::time::Instant::now() + DUMP_URL_IDLE_TIMEOUT;
             let frame = match tokio::time::timeout_at(idle.min(until), body.frame()).await {
                 Ok(Some(f)) => f,
-                Ok(None) => break,
+                Ok(None) => {
+                    // the whole body has arrived: only now may the loader take the end of the data for the end of
+                    // the dump (this task is aborted when the create request is abandoned)
+                    let _ = tx.send(Ok(None)).await;
+                    break;
+                }
                 Err(_) => {
                     let why = if idle < until {
                         "dump url stalled"
@@ -659,7 +692,7 @@ async fn fetch_dump(
             };
             let item = match frame {
                 Ok(f) => match f.into_data() {
-                    Ok(d) => Ok(d),
+                    Ok(d) => Ok(Some(d)),
                     Err(_) => continue,
                 },
                 Err(e) => Err(io::Error::other(e)),
@@ -777,6 +810,137 @@ mod tests {
     }
 
     const HEALTH: &[u8] = b"GET /health HTTP/1.1\r\nHost: tenant.db\r\n\r\n";
+
+    /// Review of 0.1.0, finding 6. What gives a web page away: the Host of a rebound domain, or the headers browsers
+    /// add to cross-site requests. Node's `fetch` sends `sec-fetch-mode` and is a local client like any other.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn requests_from_web_pages_are_refused() {
+        let (_d, app) = app(|_| {});
+        app.create("tenant", None).await.unwrap();
+        let insert = r#"{"requests":[{"type":"execute","stmt":{"sql":"CREATE TABLE t(a)"}}]}"#;
+        let post = |host: &'static str, extra: Option<(&'static str, &'static str)>| {
+            let mut req = axum::http::Request::post("/v2/pipeline")
+                .header(header::HOST, host)
+                .header(header::CONTENT_TYPE, "text/plain");
+            if let Some((k, v)) = extra {
+                req = req.header(k, v);
+            }
+            user_router(app.clone()).oneshot(req.body(Body::from(insert)).unwrap())
+        };
+        let refused = [
+            // a page on a rebound name, as its own origin: with the headers of a POST, and with none at all
+            (
+                "tenant.attacker.example",
+                Some(("origin", "http://tenant.attacker.example")),
+            ),
+            ("tenant.attacker.example", Some(("sec-fetch-site", "same-origin"))),
+            ("tenant.attacker.example", None),
+            ("tenant.db.attacker.example:8080", None),
+            // a cross-site request to a local name: a form post, a `no-cors` fetch
+            ("tenant.localhost:8080", Some(("origin", "https://attacker.example"))),
+            ("tenant.localhost:8080", Some(("sec-fetch-site", "cross-site"))),
+            ("tenant.db", Some(("origin", "null"))),
+        ];
+        for (host, extra) in refused {
+            let r = post(host, extra).await.unwrap();
+            assert_eq!(r.status(), StatusCode::FORBIDDEN, "{host} {extra:?}");
+        }
+        // the same-origin GET of a rebound page carries nothing but its Host
+        for uri in ["/dump", "/metrics", "/health"] {
+            let r = get(&app, uri, "tenant.attacker.example").await;
+            assert_eq!(r.status(), StatusCode::FORBIDDEN, "{uri}");
+        }
+        for (host, extra) in [
+            ("sqld-admin", Some(("sec-fetch-site", "cross-site"))),
+            ("admin.attacker.example", None),
+        ] {
+            let mut delete = axum::http::Request::delete("/v1/namespaces/tenant").header(header::HOST, host);
+            if let Some((k, v)) = extra {
+                delete = delete.header(k, v);
+            }
+            let r = admin_router(app.clone())
+                .oneshot(delete.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(r.status(), StatusCode::FORBIDDEN, "{host}");
+        }
+        assert!(app.exists("tenant"));
+        let c = rusqlite::Connection::open(app.cfg.db_file("tenant")).unwrap();
+        let tables: i64 = c
+            .query_row("SELECT count(*) FROM sqlite_schema", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(tables, 0, "nothing ran");
+        // local clients: the hosts in use, with or without the header Node's fetch adds
+        for (host, extra) in [
+            ("tenant.db", Some(("sec-fetch-mode", "cors"))),
+            ("tenant.local", None),
+            ("tenant.localhost:8080", None),
+        ] {
+            let r = post(host, extra).await.unwrap();
+            assert_eq!(r.status(), StatusCode::OK, "{host} {extra:?}");
+        }
+        assert_eq!(get(&app, "/health", "127.0.0.1:8080").await.status(), StatusCode::OK);
+        assert_eq!(get(&app, "/health", "[::1]:8080").await.status(), StatusCode::OK);
+        // a request without a Host header (HTTP/1.0) names no database
+        let no_host = axum::http::Request::post("/v2/pipeline")
+            .body(Body::from(insert))
+            .unwrap();
+        let r = user_router(app.clone()).oneshot(no_host).await.unwrap();
+        assert_eq!(r.status(), StatusCode::NOT_FOUND);
+        // other names are a matter of configuration
+        let (_d, open) = self::app(|c| c.allowed_host_suffixes = vec!["sqld.example".into()]);
+        assert_eq!(
+            get(&open, "/health", "tenant.sqld.example").await.status(),
+            StatusCode::OK
+        );
+        assert_eq!(get(&open, "/health", "tenant.db").await.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// Review of 0.1.0, finding 5: the admin client gives up while the dump is still on its way
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_create_abandoned_during_the_download_creates_nothing() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (mut c, _) = listener.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    let _ = c.read(&mut buf).await;
+                    // the head at once, the body (a complete dump) later: like GET /dump while it copies the database
+                    let _ = c
+                        .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+                        .await;
+                    tokio::time::sleep(Duration::from_millis(600)).await;
+                    let body = "PRAGMA foreign_keys=OFF;\nBEGIN TRANSACTION;\nCREATE TABLE t(a);\nCOMMIT;\n";
+                    let _ = c
+                        .write_all(format!("{:x}\r\n{}\r\n0\r\n\r\n", body.len(), body).as_bytes())
+                        .await;
+                });
+            }
+        });
+        let (_d, app) = app(|_| {});
+        let create = || {
+            let req = axum::http::Request::post("/v1/namespaces/tenant/create")
+                .header(header::HOST, "sqld-admin")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(format!(r#"{{"dump_url":"http://{addr}/dump"}}"#)))
+                .unwrap();
+            admin_router(app.clone()).oneshot(req)
+        };
+        let r = tokio::time::timeout(Duration::from_millis(200), create()).await;
+        assert!(r.is_err(), "the request should still be running");
+        // the abandoned build ends without a database, and the name is free for the next try
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!app.exists("tenant"), "an abandoned create left a database in place");
+        assert_eq!(create().await.unwrap().status(), StatusCode::OK);
+        let c = rusqlite::Connection::open(app.cfg.db_file("tenant")).unwrap();
+        let tables: i64 = c
+            .query_row("SELECT count(*) FROM sqlite_schema", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(tables, 1);
+    }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn slow_heads_and_idle_connections_are_closed() {

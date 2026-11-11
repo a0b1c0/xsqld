@@ -456,6 +456,10 @@ impl Thread {
                 solo.extend(pending.drain(..));
                 break;
             }
+            // from here to the COMMIT below nothing a request runs may commit: the requests before it would stay
+            // written and be redone. A COMMIT that gets through the statement classification is rolled back instead
+            // and handled as a lost group.
+            self.conn.refuse_commits(true);
             let started = Instant::now();
             let mut done: Vec<(Job, Results, bool)> = Vec::with_capacity(pending.len());
             while let Some(job) = pending.pop_front() {
@@ -525,6 +529,7 @@ impl Thread {
                 break;
             }
             let commit_started = Instant::now();
+            self.conn.refuse_commits(false);
             match self.conn.c.execute_batch("COMMIT") {
                 Ok(()) => {
                     let took = commit_started.elapsed();
@@ -556,6 +561,8 @@ impl Thread {
             }
             break;
         }
+        // no group transaction is open past this point (requests on their own commit as written)
+        self.conn.refuse_commits(false);
         self.metrics.solo_requests.fetch_add(solo.len() as u64, Relaxed);
         let mut solo = solo.into_iter();
         for job in solo.by_ref() {
@@ -617,16 +624,39 @@ impl Thread {
             self.run_pinned(job);
             return;
         }
-        match self.rx.recv_timeout(until.saturating_duration_since(Instant::now())) {
+        let wake = self.expire_backlog().map_or(until, |next| next.min(until));
+        match self.rx.recv_timeout(wake.saturating_duration_since(Instant::now())) {
             Ok(Msg::Job(j)) if j.stream == stream => self.run_pinned(j),
             Ok(Msg::Job(j)) => self.backlog.push_back(j),
             Ok(Msg::Stop(ack)) => self.stop = Some(ack),
-            Err(RecvTimeoutError::Timeout) => {
+            Err(RecvTimeoutError::Timeout) if Instant::now() >= until => {
                 self.metrics.pinned_timeouts.fetch_add(1, Relaxed);
                 self.unpin("open transaction timed out");
             }
+            Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => self.unpin("shutting down"),
         }
+    }
+
+    /// While pinned: answers the queued jobs whose wait or deadline has run out now, as `admit` would once the
+    /// transaction ends, instead of keeping their clients until then. Returns when the next one runs out.
+    fn expire_backlog(&mut self) -> Option<Instant> {
+        let now = Instant::now();
+        let queue_timeout = self.cfg.queue_timeout();
+        let mut next: Option<Instant> = None;
+        let mut i = 0;
+        while i < self.backlog.len() {
+            let j = &self.backlog[i];
+            let runs_out = (j.enqueued + queue_timeout).min(j.deadline);
+            if runs_out <= now || j.reply.is_closed() {
+                let job = self.backlog.remove(i).expect("index is valid");
+                let _ = self.admit(job);
+                continue;
+            }
+            next = Some(next.map_or(runs_out, |n| n.min(runs_out)));
+            i += 1;
+        }
+        next
     }
 
     fn run_pinned(&mut self, job: Job) {
@@ -897,6 +927,115 @@ mod tests {
         assert_eq!(f.metrics.group_requests.load(Relaxed), 5);
     }
 
+    /// Review of 0.1.0, finding 1: `\u{feff}COMMIT` was taken for an ordinary statement and committed the group
+    /// transaction for real; the group was then redone and the requests before it were written twice
+    #[test]
+    fn transaction_keywords_behind_whitespace_only_sqlite_skips_stay_inside_their_request() {
+        let f = fixture(|c| c.group_linger_us = 100_000);
+        let execs = |sqls: &[&str]| {
+            let v: Vec<_> = sqls
+                .iter()
+                .map(|s| serde_json::json!({"type": "execute", "stmt": {"sql": s}}))
+                .collect();
+            serde_json::to_string(&v).unwrap()
+        };
+        assert!(is_ok(&f.send(1, false, &execs(&["CREATE TABLE d(v TEXT)"])), 0));
+        let hidden = [
+            "\u{feff}COMMIT",
+            "\u{feff}END",
+            "\u{a0}COMMIT",
+            " \u{b}COMMIT",
+            "\u{3000}ROLLBACK",
+        ];
+        for (i, hidden) in hidden.iter().enumerate() {
+            let jobs = vec![
+                f.job(1, false, &execs(&[&format!("INSERT INTO d VALUES ('a{i}')")])),
+                f.job(2, false, &execs(&[&format!("INSERT INTO d VALUES ('bad{i}')"), hidden])),
+                f.job(3, false, &execs(&[&format!("INSERT INTO d VALUES ('b{i}')")])),
+            ];
+            let rxs: Vec<_> = jobs
+                .into_iter()
+                .map(|(j, rx)| {
+                    f.writer.submit(j);
+                    rx
+                })
+                .collect();
+            let outcomes: Vec<_> = rxs.into_iter().map(|rx| rx.blocking_recv().unwrap()).collect();
+            assert!(is_ok(&outcomes[0], 0) && is_ok(&outcomes[2], 0), "{hidden:?}");
+            // like a bare COMMIT outside a transaction: the insert stays, the keyword is an error
+            assert!(is_ok(&outcomes[1], 0) && !is_ok(&outcomes[1], 1), "{hidden:?}");
+            let c = rusqlite::Connection::open(&f.path).unwrap();
+            for v in ["a", "bad", "b"] {
+                let n: i64 = c
+                    .query_row("SELECT count(*) FROM d WHERE v = ?1", [format!("{v}{i}")], |r| r.get(0))
+                    .unwrap();
+                assert_eq!(n, 1, "{v} after {hidden:?}");
+            }
+        }
+        assert_eq!(f.metrics.group_lost.load(Relaxed), 0);
+        // and statements that must run on their own are still recognized
+        for sql in [
+            "\u{feff}PRAGMA defer_foreign_keys = ON",
+            "\u{a0}SAVEPOINT x",
+            " \u{b}VACUUM",
+        ] {
+            assert!(f.job(1, false, &execs(&[sql])).0.solo, "{sql:?}");
+        }
+    }
+
+    /// The backstop behind the classification: a COMMIT inside the group transaction that is not the write thread's
+    /// own rolls the group back; the group is redone and nothing is written twice
+    #[test]
+    fn a_commit_the_classification_does_not_know_rolls_the_group_back() {
+        let f = fixture(|c| c.group_linger_us = 100_000);
+        let execs = |sqls: &[&str]| {
+            let v: Vec<_> = sqls
+                .iter()
+                .map(|s| serde_json::json!({"type": "execute", "stmt": {"sql": s}}))
+                .collect();
+            serde_json::to_string(&v).unwrap()
+        };
+        assert!(is_ok(&f.send(1, false, &execs(&["CREATE TABLE d(v TEXT)"])), 0));
+        let commit = format!("{}COMMIT", sql::UNCLASSIFIED);
+        assert_eq!(sql::classify(&commit), sql::Kind::Other);
+        let jobs = vec![
+            f.job(1, false, &execs(&["INSERT INTO d VALUES ('a')"])),
+            f.job(2, false, &execs(&["INSERT INTO d VALUES ('a2')"])),
+            f.job(3, false, &execs(&["INSERT INTO d VALUES ('bad')", &commit])),
+            f.job(4, false, &execs(&["INSERT INTO d VALUES ('b')"])),
+        ];
+        let rxs: Vec<_> = jobs
+            .into_iter()
+            .map(|(j, rx)| {
+                f.writer.submit(j);
+                rx
+            })
+            .collect();
+        let outcomes: Vec<_> = rxs.into_iter().map(|rx| rx.blocking_recv().unwrap()).collect();
+        for i in [0, 1, 3] {
+            assert!(is_ok(&outcomes[i], 0), "{:?}", outcomes[i]);
+        }
+        // on its own, as written: the insert commits by itself, the COMMIT finds no transaction
+        assert!(is_ok(&outcomes[2], 0) && !is_ok(&outcomes[2], 1), "{:?}", outcomes[2]);
+        let c = rusqlite::Connection::open(&f.path).unwrap();
+        let rows: Vec<String> = c
+            .prepare("SELECT v FROM d ORDER BY v")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(rows, ["a", "a2", "b", "bad"], "each acknowledged insert is there once");
+        assert_eq!(f.metrics.group_lost.load(Relaxed), 1);
+        // the refusal ends with the group: later groups and requests on their own commit
+        assert!(is_ok(&f.send(1, false, &execs(&["INSERT INTO d VALUES ('later')"])), 0));
+        assert!(is_ok(&f.send(1, false, &execs(&["PRAGMA user_version = 7"])), 0));
+        let later: i64 = c
+            .query_row("SELECT count(*) FROM d WHERE v = 'later'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(later, 1);
+    }
+
     #[test]
     fn lost_group_is_redone_without_the_culprit() {
         let f = fixture(|c| c.group_linger_us = 50_000);
@@ -945,6 +1084,51 @@ mod tests {
         assert_eq!(f.count(), 1, "the pinned insert was rolled back");
         let o = f.send(7, true, r#"[{"type":"execute","stmt":{"sql":"COMMIT"}}]"#);
         assert!(matches!(o, Outcome::StreamExpired));
+    }
+
+    #[test]
+    fn queued_jobs_run_out_on_time_while_a_transaction_is_open() {
+        let f = fixture(|c| {
+            c.pinned_tx_timeout_ms = 4000;
+            c.queue_timeout_ms = 300;
+        });
+        let o = f.send(7, false, r#"[{"type":"execute","stmt":{"sql":"BEGIN"}},{"type":"execute","stmt":{"sql":"INSERT INTO t(b) VALUES ('p')"}}]"#);
+        assert!(matches!(o, Outcome::Done { pinned: true, .. }));
+        let started = Instant::now();
+        let (waits, waits_rx) = f.job(
+            8,
+            false,
+            r#"[{"type":"execute","stmt":{"sql":"INSERT INTO t(b) VALUES ('q')"}}]"#,
+        );
+        f.writer.submit(waits);
+        let (mut due, due_rx) = f.job(
+            9,
+            false,
+            r#"[{"type":"execute","stmt":{"sql":"INSERT INTO t(b) VALUES ('r')"}}]"#,
+        );
+        due.deadline = started + Duration::from_millis(150);
+        f.writer.submit(due);
+
+        assert!(matches!(due_rx.blocking_recv().unwrap(), Outcome::Deadline));
+        assert!(
+            started.elapsed() < Duration::from_millis(280),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(matches!(waits_rx.blocking_recv().unwrap(), Outcome::QueueTimeout));
+        let waited = started.elapsed();
+        assert!(
+            waited >= Duration::from_millis(300) && waited < Duration::from_secs(1),
+            "{waited:?}"
+        );
+
+        let o = f.send(7, true, r#"[{"type":"execute","stmt":{"sql":"COMMIT"}}]"#);
+        assert!(
+            matches!(o, Outcome::Done { pinned: false, .. }),
+            "the open transaction is still there"
+        );
+        assert_eq!(f.metrics.pinned_timeouts.load(Relaxed), 0);
+        assert_eq!(f.count(), 1, "the expired requests did not run");
     }
 
     #[test]

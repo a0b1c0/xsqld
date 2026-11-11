@@ -77,9 +77,7 @@ pub fn looks_read_only(requests: &[StreamRequest]) -> bool {
 fn run_read(conn: &Conn, requests: Vec<StreamRequest>, deadline: Instant, budget: u64) -> ReadOutcome {
     // statements that fail before running give the same error on either side
     let read_only = exec::statements(&requests).all(|s| {
-        sql::classify(s) == Kind::Empty
-            || sql::many_statements(s)
-            || conn.c.prepare_cached(s).is_ok_and(|st| st.readonly())
+        sql::classify(s) == Kind::Empty || sql::many_statements(s) || conn.prepare(s).is_ok_and(|st| st.readonly())
     });
     if !read_only {
         return ReadOutcome::NeedsWriter(requests);

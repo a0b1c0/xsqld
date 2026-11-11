@@ -33,8 +33,9 @@ pub struct Registry {
     open: parking_lot::RwLock<HashMap<Arc<str>, Arc<Db>>>,
     /// Per database: opening, creating and deleting it, one at a time (other databases are not held up, e.g. while
     /// one is built from a long dump). Creating and deleting hand the guard to their blocking work, so a cancelled
-    /// HTTP request cannot let a second one start while the first is still running.
-    locks: parking_lot::Mutex<HashMap<String, Arc<AsyncMutex<()>>>>,
+    /// HTTP request cannot let a second one start while the first is still running. An entry lives only while
+    /// someone holds or waits for it, so names that never become databases leave nothing behind.
+    locks: Locks,
     /// `GET /dump` in progress, each with a copy of its database on disk (`--max-concurrent-dumps`)
     pub dumps: Arc<tokio::sync::Semaphore>,
 }
@@ -66,9 +67,17 @@ impl Registry {
         })
     }
 
-    async fn lock(&self, ns: &str) -> tokio::sync::OwnedMutexGuard<()> {
-        let m = self.locks.lock().entry(ns.to_owned()).or_default().clone();
-        m.lock_owned().await
+    /// Built before waiting, so that a request cancelled while it waits also cleans up after itself
+    async fn lock(&self, ns: &str) -> NsGuard {
+        let entry = self.locks.lock().entry(ns.to_owned()).or_default().clone();
+        let mut g = NsGuard {
+            locks: self.locks.clone(),
+            ns: ns.to_owned(),
+            entry: Some(entry.clone()),
+            guard: None,
+        };
+        g.guard = Some(entry.lock_owned().await);
+        g
     }
 
     fn path(&self, ns: &str) -> PathBuf {
@@ -127,11 +136,7 @@ impl Registry {
 
     /// `POST /v1/namespaces/<ns>/create`: an empty database, or one built from an SQL dump (`dump` yields its bytes).
     /// It is opened on first use.
-    pub async fn create(
-        &self,
-        ns: &str,
-        dump: Option<tokio::sync::mpsc::Receiver<std::io::Result<bytes::Bytes>>>,
-    ) -> Result<(), AdminError> {
+    pub async fn create(&self, ns: &str, dump: Option<DumpRx>) -> Result<(), AdminError> {
         if !valid_namespace(ns) {
             return Err(AdminError::BadName(ns.to_owned()));
         }
@@ -187,6 +192,34 @@ impl Registry {
     }
 }
 
+type Locks = Arc<parking_lot::Mutex<HashMap<String, Arc<AsyncMutex<()>>>>>;
+
+/// The bytes of an SQL dump on their way in: chunks, then `Ok(None)` when the source has ended properly. A sender
+/// that goes away without it (the download was abandoned) is an error for the reader: what arrived so far is not the
+/// whole dump, and may well end between two statements.
+pub type DumpRx = tokio::sync::mpsc::Receiver<std::io::Result<Option<bytes::Bytes>>>;
+
+/// A database's lock, held. Dropping it releases the lock and removes the map entry when nobody else holds or
+/// waits for it: a waiter clones the entry under the map lock, which is held here too, so it is never removed
+/// under a waiter.
+struct NsGuard {
+    locks: Locks,
+    ns: String,
+    entry: Option<Arc<AsyncMutex<()>>>,
+    guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+impl Drop for NsGuard {
+    fn drop(&mut self) {
+        let mut locks = self.locks.lock();
+        drop(self.guard.take());
+        drop(self.entry.take());
+        if locks.get(&self.ns).is_some_and(|m| Arc::strong_count(m) == 1) {
+            locks.remove(&self.ns);
+        }
+    }
+}
+
 fn ensure_sentinel(db: &Path) -> std::io::Result<()> {
     let Some(dir) = db.parent() else { return Ok(()) };
     let s = dir.join(SENTINEL);
@@ -198,11 +231,7 @@ fn ensure_sentinel(db: &Path) -> std::io::Result<()> {
 
 /// Builds the database file next to its final place and moves it there when complete, so a half-loaded database is
 /// never visible
-fn build(
-    path: &Path,
-    cfg: &Config,
-    dump: Option<tokio::sync::mpsc::Receiver<std::io::Result<bytes::Bytes>>>,
-) -> Result<(), AdminError> {
+fn build(path: &Path, cfg: &Config, dump: Option<DumpRx>) -> Result<(), AdminError> {
     let dir = path
         .parent()
         .ok_or_else(|| AdminError::Internal(anyhow::anyhow!("database path has no directory")))?;
@@ -254,17 +283,19 @@ fn remove_files(db: &Path, per_dir: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Blocking `Read` over the chunks of an HTTP body
+/// Blocking `Read` over the chunks of an HTTP body; the end of the data is the end marker of [`DumpRx`]
 struct ChannelReader {
-    rx: tokio::sync::mpsc::Receiver<std::io::Result<bytes::Bytes>>,
+    rx: DumpRx,
     cur: bytes::Bytes,
+    ended: bool,
 }
 
 impl ChannelReader {
-    fn new(rx: tokio::sync::mpsc::Receiver<std::io::Result<bytes::Bytes>>) -> Self {
+    fn new(rx: DumpRx) -> Self {
         Self {
             rx,
             cur: bytes::Bytes::new(),
+            ended: false,
         }
     }
 }
@@ -272,9 +303,19 @@ impl ChannelReader {
 impl std::io::Read for ChannelReader {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         while self.cur.is_empty() {
+            if self.ended {
+                return Ok(0);
+            }
             match self.rx.blocking_recv() {
-                Some(chunk) => self.cur = chunk?,
-                None => return Ok(0),
+                Some(Ok(Some(chunk))) => self.cur = chunk,
+                Some(Ok(None)) => self.ended = true,
+                Some(Err(e)) => return Err(e),
+                None => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "the dump download was abandoned before its end",
+                    ));
+                }
             }
         }
         let n = buf.len().min(self.cur.len());
@@ -293,11 +334,14 @@ mod tests {
         (dir, Registry::new(cfg))
     }
 
-    fn chunks(parts: &[&str]) -> tokio::sync::mpsc::Receiver<std::io::Result<bytes::Bytes>> {
-        let (tx, rx) = tokio::sync::mpsc::channel(parts.len().max(1));
+    /// A complete dump in these chunks
+    fn chunks(parts: &[&str]) -> DumpRx {
+        let (tx, rx) = tokio::sync::mpsc::channel(parts.len() + 1);
         for p in parts {
-            tx.try_send(Ok(bytes::Bytes::copy_from_slice(p.as_bytes()))).unwrap();
+            tx.try_send(Ok(Some(bytes::Bytes::copy_from_slice(p.as_bytes()))))
+                .unwrap();
         }
+        tx.try_send(Ok(None)).unwrap();
         rx
     }
 
@@ -321,9 +365,9 @@ mod tests {
         // review 2318 S4/S5: one lock for all databases kept every first open waiting while a dump loaded
         let (_dir, r) = registry();
         let (tx, rx) = tokio::sync::mpsc::channel(4);
-        tx.send(Ok(bytes::Bytes::from_static(
+        tx.send(Ok(Some(bytes::Bytes::from_static(
             b"PRAGMA foreign_keys=OFF;\nBEGIN TRANSACTION;\nCREATE TABLE t(a);\n",
-        )))
+        ))))
         .await
         .unwrap();
         let slow = {
@@ -340,10 +384,50 @@ mod tests {
             .await
             .expect("another database waited for the build");
         assert!(!slow.is_finished());
-        tx.send(Ok(bytes::Bytes::from_static(b"COMMIT;\n"))).await.unwrap();
+        tx.send(Ok(Some(bytes::Bytes::from_static(b"COMMIT;\n"))))
+            .await
+            .unwrap();
+        tx.send(Ok(None)).await.unwrap();
         drop(tx);
         slow.await.unwrap().unwrap();
         assert!(r.get("slow").await.unwrap().is_some());
+    }
+
+    /// Review of 0.1.0, finding 5: a download abandoned at any point (before the first byte, between two statements,
+    /// after the last one) left a database with whatever had arrived
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_abandoned_dump_download_creates_nothing() {
+        let (dir, r) = registry();
+        let whole = [
+            "PRAGMA foreign_keys=OFF;\nBEGIN TRANSACTION;\n",
+            "CREATE TABLE t(a);\n",
+            "INSERT INTO t VALUES(1);\n",
+            "COMMIT;\n",
+        ];
+        for arrived in 0..=whole.len() {
+            let (tx, rx) = tokio::sync::mpsc::channel(8);
+            for part in &whole[..arrived] {
+                tx.send(Ok(Some(bytes::Bytes::from_static(part.as_bytes()))))
+                    .await
+                    .unwrap();
+            }
+            drop(tx);
+            let e = r.create("tenant", Some(rx)).await.unwrap_err();
+            assert!(
+                matches!(&e, AdminError::BadDump(m) if m.contains("abandoned")),
+                "{arrived} chunks: {e:?}"
+            );
+            assert!(r.get("tenant").await.unwrap().is_none(), "{arrived} chunks");
+            let left: Vec<_> = std::fs::read_dir(dir.path().join("dbs/tenant"))
+                .map(|d| d.map(|e| e.unwrap().file_name()).collect())
+                .unwrap_or_default();
+            assert!(
+                left.iter().all(|f| f == ".sentinel"),
+                "{arrived} chunks: files left behind: {left:?}"
+            );
+        }
+        r.create("tenant", Some(chunks(&whole))).await.unwrap();
+        assert!(r.get("tenant").await.unwrap().is_some());
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -372,5 +456,53 @@ mod tests {
         assert!(!r.exists("other"));
         let leftovers: Vec<_> = std::fs::read_dir(dir.path().join("dbs/other")).unwrap().collect();
         assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn database_locks_are_forgotten_once_nobody_holds_them() {
+        let (_dir, r) = registry();
+        for i in 0..1000 {
+            assert!(matches!(
+                r.delete(&format!("missing{i}")).await,
+                Err(AdminError::Missing(_))
+            ));
+        }
+        assert!(matches!(
+            r.create("bad", Some(chunks(&["INSERT INTO nope VALUES(1);\n"]))).await,
+            Err(AdminError::BadDump(_))
+        ));
+        r.create("tenant", None).await.unwrap();
+        assert!(r.get("tenant").await.unwrap().is_some());
+        r.delete("tenant").await.unwrap();
+        assert_eq!(r.locks.lock().len(), 0);
+
+        // held: a waiter keeps the entry; a waiter cancelled while waiting removes its share
+        let held = r.lock("busy").await;
+        let waiter = {
+            let r = r.clone();
+            tokio::spawn(async move { drop(r.lock("busy").await) })
+        };
+        let cancelled = {
+            let r = r.clone();
+            tokio::spawn(async move { drop(r.lock("busy").await) })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        cancelled.abort();
+        let _ = cancelled.await;
+        assert_eq!(r.locks.lock().len(), 1);
+        drop(held);
+        waiter.await.unwrap();
+        assert_eq!(r.locks.lock().len(), 0);
+
+        let held = r.lock("busy").await;
+        let cancelled = {
+            let r = r.clone();
+            tokio::spawn(async move { drop(r.lock("busy").await) })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(held);
+        cancelled.abort();
+        let _ = cancelled.await;
+        assert_eq!(r.locks.lock().len(), 0, "the last waiter, cancelled, left its entry");
     }
 }

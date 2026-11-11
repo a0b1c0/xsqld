@@ -43,6 +43,10 @@ pub struct Config {
     /// Allow `dump_url` hosts other than loopback addresses (refused by default)
     #[arg(long)]
     pub allow_remote_dump_url: bool,
+    /// Requests are answered only when their Host header is an IP address, a name without a dot (`localhost`,
+    /// `sqld-admin`) or a name under one of these suffixes (comma separated); others get 403. `*` accepts every Host
+    #[arg(long, value_delimiter = ',', default_value = "db,local,localhost")]
+    pub allowed_host_suffixes: Vec<String>,
 
     /// PRAGMA synchronous of the write connection
     #[arg(long, value_enum, default_value = "full")]
@@ -134,6 +138,9 @@ pub struct Config {
     /// SQLITE_LIMIT_LENGTH: largest string or blob value (sqld's max_row_size)
     #[arg(long, default_value_t = 5 * 1024 * 1024)]
     pub max_value_bytes: i32,
+    /// SQLITE_LIMIT_LIKE_PATTERN_LENGTH: longest LIKE or GLOB pattern (SQLite and sqld: 50000)
+    #[arg(long, default_value_t = 1000)]
+    pub max_like_pattern_bytes: i32,
 }
 
 #[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
@@ -188,6 +195,35 @@ impl Config {
     }
     pub fn dump_url_timeout(&self) -> Duration {
         Duration::from_millis(self.dump_url_timeout_ms)
+    }
+
+    /// Is a request with this Host header answered? (`--allowed-host-suffixes`)
+    ///
+    /// The database is chosen by the Host header and nothing else identifies a client, so a web page whose domain
+    /// has been re-pointed at this machine (DNS rebinding) would read and write as a local client. Such a page's
+    /// Host is the attacker's domain; the hosts local clients use are IP addresses, single names and names under a
+    /// few private suffixes.
+    pub fn host_allowed(&self, host: &str) -> bool {
+        if self.allowed_host_suffixes.iter().any(|s| s == "*") {
+            return true;
+        }
+        // `[::1]:8080`: an IPv6 address
+        if host.starts_with('[') {
+            return true;
+        }
+        let name = host.split(':').next().unwrap_or_default();
+        let name = name.strip_suffix('.').unwrap_or(name);
+        if !name.contains('.') || name.parse::<std::net::Ipv4Addr>().is_ok() {
+            return true;
+        }
+        let name = name.as_bytes();
+        self.allowed_host_suffixes.iter().any(|s| {
+            let s = s.trim_start_matches('.').as_bytes();
+            !s.is_empty()
+                && name.len() > s.len()
+                && name[name.len() - s.len() - 1] == b'.'
+                && name[name.len() - s.len()..].eq_ignore_ascii_case(s)
+        })
     }
 
     /// Scratch files of the server (copies made for `GET /dump`); emptied at startup
@@ -271,6 +307,47 @@ mod tests {
         assert!(!valid_namespace(".tmp"));
         assert!(!valid_namespace("a/b"));
         assert!(!valid_namespace(&"a".repeat(65)));
+    }
+
+    /// Review of 0.1.0, finding 6: the hosts the local clients use are accepted, a public domain is not
+    #[test]
+    fn host_allowlist() {
+        let c = Config::for_tests(std::path::Path::new("/tmp"));
+        for host in [
+            "tenant.db",
+            "tenant.local",
+            "TDB_000.Local:8080",
+            "platform.localhost:8080",
+            "tenant.db.",
+            "sqld-admin",
+            "localhost",
+            "localhost:8081",
+            "127.0.0.1",
+            "127.0.0.1:8080",
+            "10.0.0.5:8080",
+            "[::1]:8080",
+            "",
+        ] {
+            assert!(c.host_allowed(host), "{host}");
+        }
+        for host in [
+            "tenant.evil.example",
+            "tenant.evil.example:8080",
+            "tenant.db.evil.example",
+            "evil.example",
+            "tenantdb.xlocal",
+            "127.0.0.1.evil.example",
+            "a.b",
+        ] {
+            assert!(!c.host_allowed(host), "{host}");
+        }
+        let c = Config::parse_from(["xsqld", "--allowed-host-suffixes", "db,.Sqld.Example"]);
+        assert!(c.host_allowed("tenant.sqld.example:8080"));
+        assert!(c.host_allowed("tenant.db"));
+        assert!(!c.host_allowed("tenant.local"));
+        assert!(!c.host_allowed("sqld.example"));
+        assert!(Config::parse_from(["xsqld", "--allowed-host-suffixes", "*"]).host_allowed("tenant.evil.example"));
+        assert!(!Config::parse_from(["xsqld", "--allowed-host-suffixes", ""]).host_allowed("tenant.db"));
     }
 
     #[test]
