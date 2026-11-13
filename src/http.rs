@@ -94,13 +94,105 @@ pub async fn serve(
         };
         let _ = stream.set_nodelay(true);
         let service = hyper_util::service::TowerToHyperService::new(router.clone());
-        let conn = graceful.watch(http.serve_connection(hyper_util::rt::TokioIo::new(stream), service));
+        let io = WriteTimeout {
+            io: stream,
+            limit: cfg.response_write_timeout(),
+            stalled: None,
+        };
+        let conn = graceful.watch(http.serve_connection(hyper_util::rt::TokioIo::new(io), service));
         tokio::spawn(async move {
             let _slot = slot;
             let _ = conn.await;
         });
     }
     graceful.shutdown().await;
+}
+
+/// A client connection's socket with a limit on writing: a write that makes no progress for
+/// `--response-write-timeout-ms` (the client takes no data) fails, which ends the connection and frees its slot.
+/// Without it a client that sends requests and never reads the responses kept its connection for as long as it
+/// liked, and `--max-connections` such clients locked everyone else out. A client that reads slowly but steadily
+/// is not cut off: every write that goes through starts the time again.
+struct WriteTimeout {
+    io: tokio::net::TcpStream,
+    limit: Duration,
+    /// Armed when a write first had to wait; cleared by the next write that goes through
+    stalled: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
+}
+
+impl WriteTimeout {
+    fn limit<T>(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+        r: std::task::Poll<io::Result<T>>,
+    ) -> std::task::Poll<io::Result<T>> {
+        use std::future::Future;
+        use std::task::Poll;
+        if r.is_ready() {
+            self.stalled = None;
+            return r;
+        }
+        let limit = self.limit;
+        let stalled = self.stalled.get_or_insert_with(|| Box::pin(tokio::time::sleep(limit)));
+        match stalled.as_mut().poll(cx) {
+            Poll::Ready(()) => Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "the client took no response data within --response-write-timeout-ms",
+            ))),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl tokio::io::AsyncRead for WriteTimeout {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().io).poll_read(cx, buf)
+    }
+}
+
+impl tokio::io::AsyncWrite for WriteTimeout {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        let r = std::pin::Pin::new(&mut this.io).poll_write(cx, buf);
+        this.limit(cx, r)
+    }
+
+    fn poll_write_vectored(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> std::task::Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        let r = std::pin::Pin::new(&mut this.io).poll_write_vectored(cx, bufs);
+        this.limit(cx, r)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.io.is_write_vectored()
+    }
+
+    fn poll_flush(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<io::Result<()>> {
+        let this = self.get_mut();
+        let r = std::pin::Pin::new(&mut this.io).poll_flush(cx);
+        this.limit(cx, r)
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        let this = self.get_mut();
+        let r = std::pin::Pin::new(&mut this.io).poll_shutdown(cx);
+        this.limit(cx, r)
+    }
 }
 
 #[derive(Clone)]
@@ -393,6 +485,7 @@ async fn dump(State(app): State<App>, headers: HeaderMap, Query(q): Query<DumpQu
     let path = app.cfg.db_file(&db.name);
     let cfg = app.cfg.clone();
     let ns = db.name.clone();
+    let gate = db.readers.gate.clone();
     let rt = tokio::runtime::Handle::current();
     let (tx, rx) = tokio::sync::mpsc::channel::<io::Result<Bytes>>(4);
     // set before the sender is dropped: the body then ends with an error, never with a clean end after a cut-off
@@ -409,7 +502,7 @@ async fn dump(State(app): State<App>, headers: HeaderMap, Query(q): Query<DumpQu
             stall: cfg.dump_stall_timeout(),
             until: started + cfg.dump_max(),
         };
-        let r = dump::Snapshot::take(&path, &cfg)
+        let r = dump::Snapshot::take(&path, &cfg, &gate)
             .and_then(|snap| dump::export(&snap.conn, &mut out, q.preserve_row_ids.unwrap_or(false)))
             .and_then(|_| out.flush().map_err(Into::into));
         match r {
@@ -503,6 +596,14 @@ async fn create(State(app): State<App>, Path(ns): Path<String>, headers: HeaderM
             );
         }
     };
+    // before the download: a dump URL often carries a one-time token, not to be used up for a create that fails
+    // anyway (checked again under the database's lock)
+    if !app.cfg.usable_namespace(&ns) {
+        return admin_error(AdminError::BadName(ns));
+    }
+    if app.exists(&ns) {
+        return admin_error(AdminError::Exists(ns));
+    }
     let mut pump = None;
     let dump = match req.dump_url {
         None => None,
@@ -512,7 +613,7 @@ async fn create(State(app): State<App>, Path(ns): Path<String>, headers: HeaderM
                 Some(rx)
             }
             Err(e) => {
-                tracing::warn!(ns, url = redact(&url), error = %e.1, "dump_url failed");
+                tracing::warn!(ns, url = redact(&url), error = ?e.1, "dump_url failed");
                 return error(e.0, e.1);
             }
         },
@@ -555,10 +656,16 @@ impl Drop for AbortOnDrop {
     }
 }
 
-/// `http://host[:port]/path` → (host, port, path-and-query). Only plain http: the dump comes from this machine.
+/// `http://host[:port]/path` → (host, port, path-and-query). Only plain http: the dump comes from this machine. A
+/// host is a name, an IPv4 address or an IPv6 address in brackets; user names and passwords are refused, and so is
+/// any control character or space (which a URL cannot hold, and which would end up in the log)
 fn parse_http_url(url: &str) -> Result<(String, u16, String), (StatusCode, String)> {
+    let invalid = || (StatusCode::BAD_REQUEST, "Invalid dump url".to_owned());
+    if url.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return Err(invalid());
+    }
     let Some((scheme, rest)) = url.split_once("://") else {
-        return Err((StatusCode::BAD_REQUEST, "Invalid dump url".into()));
+        return Err(invalid());
     };
     if !scheme.eq_ignore_ascii_case("http") {
         return Err((
@@ -566,37 +673,50 @@ fn parse_http_url(url: &str) -> Result<(String, u16, String), (StatusCode, Strin
             format!("Unsupported dump url scheme `{scheme}`, supported schemes are: `http`"),
         ));
     }
-    let (authority, path) = match rest.find('/') {
-        Some(i) => (&rest[..i], &rest[i..]),
+    let (authority, path) = match rest.find(['/', '?', '#']) {
+        Some(i) if rest.as_bytes()[i] == b'/' => (&rest[..i], &rest[i..]),
+        Some(i) => (&rest[..i], "/"),
         None => (rest, "/"),
     };
+    let path = path.split('#').next().unwrap_or("/");
     if authority.contains('@') || authority.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "Invalid dump url".into()));
+        return Err(invalid());
     }
-    let (host, port) = match authority.rsplit_once(':') {
-        Some((h, p)) if !h.ends_with(']') || h.starts_with('[') => (
-            h,
-            p.parse::<u16>()
-                .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid dump url".to_owned()))?,
-        ),
-        _ => (authority, 80),
+    let port = |p: &str| p.parse::<u16>().map_err(|_| invalid());
+    let (host, port) = if let Some(v6) = authority.strip_prefix('[') {
+        let (host, after) = v6.split_once(']').ok_or_else(invalid)?;
+        match after {
+            "" => (host, 80),
+            _ => (host, port(after.strip_prefix(':').ok_or_else(invalid)?)?),
+        }
+    } else {
+        match authority.split_once(':') {
+            // more than one `:` is an IPv6 address without brackets
+            Some((h, p)) if !p.contains(':') => (h, port(p)?),
+            Some(_) => return Err(invalid()),
+            None => (authority, 80),
+        }
     };
-    Ok((
-        host.trim_start_matches('[').trim_end_matches(']').to_owned(),
-        port,
-        path.to_owned(),
-    ))
+    if host.is_empty() {
+        return Err(invalid());
+    }
+    Ok((host.to_owned(), port, path.to_owned()))
 }
 
-/// Dump URLs carry a one-time token in the path or the query: logs and errors show only scheme, host and port
+/// Dump URLs carry a one-time token in the path or the query: logs and errors show only scheme, host and port, never
+/// a user name or password, and control characters escaped
 fn redact(url: &str) -> String {
-    match url.split_once("://") {
-        Some((scheme, rest)) => format!(
-            "{scheme}://{}/***",
-            rest.split(['/', '?', '#']).next().unwrap_or_default()
-        ),
+    let shown = match url.split_once("://") {
+        Some((scheme, rest)) => {
+            let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+            match authority.rsplit_once('@') {
+                Some((_, host)) => format!("{scheme}://***@{host}/***"),
+                None => format!("{scheme}://{authority}/***"),
+            }
+        }
         None => "***".into(),
-    }
+    };
+    shown.chars().flat_map(|c| c.escape_debug()).collect()
 }
 
 /// Host header for the dump URL's host (an IPv6 literal goes in brackets)
@@ -942,6 +1062,42 @@ mod tests {
         assert_eq!(tables, 1);
     }
 
+    /// Review of 0.1.0: the dump URL was fetched before the database name was checked, using up a one-time token for
+    /// a create that could not succeed
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_create_that_cannot_succeed_does_not_fetch_the_dump() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let fetched = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let f = fetched.clone();
+        tokio::spawn(async move {
+            while listener.accept().await.is_ok() {
+                f.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        });
+        let (_d, app) = app(|c| c.db_file_template = "{ns}/data".into());
+        app.create("taken", None).await.unwrap();
+        for (ns, status) in [
+            ("bad.name", StatusCode::BAD_REQUEST),
+            ("xsqld-tmp", StatusCode::BAD_REQUEST),
+            ("taken", StatusCode::BAD_REQUEST),
+        ] {
+            let req = axum::http::Request::post(format!("/v1/namespaces/{ns}/create"))
+                .header(header::HOST, "sqld-admin")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(format!(r#"{{"dump_url":"http://{addr}/dump/token"}}"#)))
+                .unwrap();
+            let r = admin_router(app.clone()).oneshot(req).await.unwrap();
+            assert_eq!(r.status(), status, "{ns}");
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            fetched.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "the dump URL was fetched"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn slow_heads_and_idle_connections_are_closed() {
         let (_d, addr, _stop) = served(|c| c.header_read_timeout_ms = 300).await;
@@ -1000,6 +1156,42 @@ mod tests {
         let mut c = tokio::net::TcpStream::connect(addr).await.unwrap();
         let (out, _) = exchange(&mut c, HEALTH, Duration::from_millis(500)).await;
         assert!(out.starts_with("HTTP/1.1 200"), "{out}");
+    }
+
+    /// Review of 0.1.0: writing a response had no time limit, so a client that sent a request and never read the
+    /// answer kept its connection, and `--max-connections` such clients locked everyone else out
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_client_that_takes_no_response_data_loses_its_connection() {
+        let (_d, app) = app(|c| {
+            c.max_connections = 1;
+            c.response_write_timeout_ms = 300;
+        });
+        app.create("tenant", None).await.unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (_stop, rx) = tokio::sync::watch::channel(false);
+        tokio::spawn(serve(listener, user_router(app.clone()), app.cfg.clone(), rx));
+        // about 40 MB of JSON, far more than the socket buffers hold
+        let body = r#"{"requests":[{"type":"execute","stmt":{"sql":"WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 8) SELECT randomblob(4000000) FROM n"}}]}"#;
+        let req = format!(
+            "POST /v2/pipeline HTTP/1.1\r\nHost: tenant.db\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let mut silent = tokio::net::TcpStream::connect(addr).await.unwrap();
+        tokio::io::AsyncWriteExt::write_all(&mut silent, req.as_bytes())
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let started = Instant::now();
+        let mut next = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let health = b"GET /health HTTP/1.1\r\nHost: tenant.db\r\nConnection: close\r\n\r\n";
+        let (out, _) = exchange(&mut next, health, Duration::from_secs(5)).await;
+        assert!(
+            out.starts_with("HTTP/1.1 200"),
+            "the only connection slot stayed taken: {out:?}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(4));
+        drop(silent);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1128,6 +1320,38 @@ mod tests {
         assert_eq!(parse_http_url("ftp://x").unwrap_err().0, StatusCode::BAD_REQUEST);
         assert!(parse_http_url("file:///etc/passwd").is_err());
         assert!(parse_http_url("http://user@127.0.0.1/x").is_err());
+        // review of 0.1.0: an IPv6 address without a port was refused
+        assert_eq!(
+            parse_http_url("http://[::1]/x").unwrap(),
+            ("::1".into(), 80, "/x".into())
+        );
+        assert_eq!(parse_http_url("http://[::1]").unwrap(), ("::1".into(), 80, "/".into()));
+        assert_eq!(
+            parse_http_url("http://127.0.0.1:9?t=1").unwrap(),
+            ("127.0.0.1".into(), 9, "/".into())
+        );
+        assert_eq!(
+            parse_http_url("http://h/d?t=1#frag").unwrap(),
+            ("h".into(), 80, "/d?t=1".into())
+        );
+        for bad in [
+            "http://::1/x",
+            "http://[::1/x",
+            "http://[::1]x/x",
+            "http://[::1]:/x",
+            "http://h:99999/x",
+            "http://:80/x",
+            "http://[]/x",
+            "http://h/x\nINFO forged",
+            "http://h/x y",
+            "http\n://h/x",
+        ] {
+            assert!(parse_http_url(bad).is_err(), "{bad:?}");
+        }
+        // review of 0.1.0: user name and password of a refused URL, and a newline in it, went into the log
+        assert_eq!(redact("http://user:pw@127.0.0.1:9/x"), "http://***@127.0.0.1:9/***");
+        assert_eq!(redact("http://a@b@127.0.0.1/x"), "http://***@127.0.0.1/***");
+        assert_eq!(redact("http\n://h\r\n/x"), "http\\n://h\\r\\n/***");
         assert_eq!(redact("http://127.0.0.1:8787/dump/SECRET"), "http://127.0.0.1:8787/***");
         assert_eq!(
             redact("http://127.0.0.1:8787?token=SECRET"),

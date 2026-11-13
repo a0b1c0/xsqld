@@ -7,14 +7,17 @@
 //!   `SAVEPOINT xsqld_client`, `COMMIT` becomes `RELEASE`, `ROLLBACK` becomes `ROLLBACK TO` + `RELEASE`, so one
 //!   client transaction failing undoes only its own work. If SQLite itself rolls back the whole transaction
 //!   (ON CONFLICT ROLLBACK, an interrupt, an I/O error) the run stops with [`Stop::GroupLost`] and the write thread
-//!   redoes the group without this request.
+//!   redoes the group without this request. A statement that leaves a deferred foreign key violation where sqld
+//!   would check it (at the statement's own commit: outside a client transaction, or the client's `COMMIT`) stops
+//!   the run with [`Stop::RunAlone`]: the write thread undoes the request and runs it on its own, where SQLite checks
+//!   it exactly there.
 
 use std::time::Instant;
 
 use rusqlite::types::{ToSqlOutput, ValueRef};
 use rusqlite::{Statement, ToSql};
 
-use crate::conn::{CLIENT_SP, Conn};
+use crate::conn::{CLIENT_SP, Conn, STMT_SP};
 use crate::proto::{self, BatchCond, BatchResult, Col, StmtResult, StreamRequest, StreamResponse, StreamResult, Value};
 use crate::sql::{self, Kind};
 
@@ -23,7 +26,8 @@ pub fn validate(requests: &[StreamRequest], max_statements: usize) -> Result<(),
     let mut statements = 0usize;
     let mut closed = false;
     for r in requests {
-        if closed {
+        // like sqld: a `close` may follow a `close`, nothing else may
+        if closed && !matches!(r, StreamRequest::Close) {
             return Err("Stream for this baton was closed".into());
         }
         match r {
@@ -83,9 +87,14 @@ pub fn statements(requests: &[StreamRequest]) -> impl Iterator<Item = &str> {
     })
 }
 
-/// The group transaction is gone (SQLite rolled it back)
-#[derive(Debug)]
-pub struct GroupLost;
+/// Why a grouped run stopped before its end
+#[derive(Debug, PartialEq, Eq)]
+pub enum Stop {
+    /// The group transaction is gone (SQLite rolled it back)
+    GroupLost,
+    /// The request must run on its own: a deferred foreign key is unresolved at a point where sqld checks it
+    RunAlone,
+}
 
 pub struct Exec<'c> {
     conn: &'c Conn,
@@ -126,7 +135,7 @@ impl<'c> Exec<'c> {
         self.client_tx
     }
 
-    pub fn run(&mut self, requests: &[StreamRequest]) -> Result<Results, GroupLost> {
+    pub fn run(&mut self, requests: &[StreamRequest]) -> Result<Results, Stop> {
         // connections are shared between streams; each request sees `last_insert_rowid` as on a fresh sqld stream
         self.conn.reset_last_insert_rowid();
         let mut out = Vec::with_capacity(requests.len());
@@ -174,7 +183,7 @@ impl<'c> Exec<'c> {
         self.client_tx = false;
     }
 
-    fn batch(&mut self, steps: &[proto::BatchStep]) -> Result<Result<BatchResult, proto::Error>, GroupLost> {
+    fn batch(&mut self, steps: &[proto::BatchStep]) -> Result<Result<BatchResult, proto::Error>, Stop> {
         // like sqld, statements that cannot even be turned into a query fail the whole batch before any step runs
         for s in steps {
             if let Some(e) = pre_check(&s.stmt).or_else(|| self.syntax_error(&s.stmt)) {
@@ -197,6 +206,8 @@ impl<'c> Exec<'c> {
                     res.step_results.push(Some(r));
                     res.step_errors.push(None);
                 }
+                // like sqld: the batch ends there and fails as a whole; the steps after it do not run
+                Err(e) if e.code == "RESPONSE_TOO_LARGE" => return Ok(Err(e)),
                 Err(e) => {
                     ok.push(false);
                     res.step_results.push(None);
@@ -216,7 +227,7 @@ impl<'c> Exec<'c> {
         (e.code == "SQL_PARSE_ERROR").then_some(e)
     }
 
-    fn stmt(&mut self, stmt: &proto::Stmt) -> Result<Result<StmtResult, proto::Error>, GroupLost> {
+    fn stmt(&mut self, stmt: &proto::Stmt) -> Result<Result<StmtResult, proto::Error>, Stop> {
         if let Some(e) = pre_check(stmt) {
             return Ok(Err(e));
         }
@@ -225,7 +236,12 @@ impl<'c> Exec<'c> {
         let started = Instant::now();
         let r = self.run_stmt(stmt, sql_text, kind, started);
         if self.grouped && self.conn.is_autocommit() {
-            return Err(GroupLost);
+            return Err(Stop::GroupLost);
+        }
+        // run alone, the statement would end with its own commit here (autocommit, or the client's COMMIT), and that
+        // commit would fail; inside the group nothing checks it, and a later statement could resolve it
+        if self.grouped && !self.client_tx && self.conn.deferred_fk_pending() {
+            return Err(Stop::RunAlone);
         }
         Ok(r)
     }
@@ -279,24 +295,40 @@ impl<'c> Exec<'c> {
                 _ => {}
             }
         }
-        let mut rows = Vec::new();
-        {
-            let mut q = st.raw_query();
-            while let Some(row) = q.next().map_err(|e| sql::rusqlite_error(&e))? {
-                let ncols = row.as_ref().column_count();
-                let mut vals = Vec::with_capacity(ncols);
-                for i in 0..ncols {
-                    let v = row.get_ref(i).map_err(|e| sql::rusqlite_error(&e))?;
-                    let size = value_size(&v);
-                    if size > self.budget {
-                        return Err(proto::Error::new("Response is too large", "RESPONSE_TOO_LARGE"));
+        // a write whose RETURNING rows go past the response limit is undone: the error it reports must mean that
+        // nothing was written (sqld reports the error and keeps the write, so a client retrying wrote twice). Only
+        // writes that return rows pay for the savepoint.
+        let undoable = kind.is_iud() && st.column_count() > 0;
+        if undoable {
+            self.conn
+                .c
+                .execute_batch(&format!("SAVEPOINT {STMT_SP}"))
+                .map_err(|e| sql::rusqlite_error(&e))?;
+        }
+        let stepped = collect_rows(&mut st, &mut self.budget);
+        if undoable {
+            let undo = || {
+                let _ = self
+                    .conn
+                    .c
+                    .execute_batch(&format!("ROLLBACK TO {STMT_SP}; RELEASE {STMT_SP};"));
+            };
+            match &stepped {
+                Err(e) if e.code == "RESPONSE_TOO_LARGE" => undo(),
+                // SQLite undid the statement; if it rolled back the whole transaction the savepoint went with it
+                Err(_) if self.conn.is_autocommit() => {}
+                Err(_) => undo(),
+                // outside a transaction this RELEASE is the statement's commit, which fails on an unresolved
+                // deferred foreign key as the statement's own commit would
+                Ok(_) => {
+                    if let Err(e) = self.conn.c.execute_batch(&format!("RELEASE {STMT_SP}")) {
+                        undo();
+                        return Err(sql::rusqlite_error(&e));
                     }
-                    self.budget -= size;
-                    vals.push(to_value(v));
                 }
-                rows.push(vals);
             }
         }
+        let rows = stepped?;
         // read after stepping: a schema change since prepare makes SQLite recompile the statement on its first
         // step, and `SELECT *` then has the new columns
         let cols: Vec<Col> = st
@@ -321,6 +353,28 @@ impl<'c> Exec<'c> {
     }
 }
 
+/// Steps the statement to its end (it is reset when this returns): the rows, or the error, RESPONSE_TOO_LARGE once
+/// the rows pass the budget
+fn collect_rows(st: &mut Statement, budget: &mut u64) -> Result<Vec<Vec<Value>>, proto::Error> {
+    let mut rows = Vec::new();
+    let mut q = st.raw_query();
+    while let Some(row) = q.next().map_err(|e| sql::rusqlite_error(&e))? {
+        let ncols = row.as_ref().column_count();
+        let mut vals = Vec::with_capacity(ncols);
+        for i in 0..ncols {
+            let v = row.get_ref(i).map_err(|e| sql::rusqlite_error(&e))?;
+            let size = value_size(&v);
+            if size > *budget {
+                return Err(proto::Error::new("Response is too large", "RESPONSE_TOO_LARGE"));
+            }
+            *budget -= size;
+            vals.push(to_value(v));
+        }
+        rows.push(vals);
+    }
+    Ok(rows)
+}
+
 fn empty_result(started: Instant) -> StmtResult {
     StmtResult {
         query_duration_ms: started.elapsed().as_micros() as f64 / 1000.0,
@@ -343,8 +397,8 @@ fn pre_check(stmt: &proto::Stmt) -> Option<proto::Error> {
             "SQL_MANY_STATEMENTS",
         ));
     }
-    if sql::classify(text) == Kind::Vacuum {
-        // sqld's parser does not support it; here it could not run anyway (it needs an attached database)
+    if matches!(sql::classify(text), Kind::Vacuum | Kind::Analyze) {
+        // sqld's parser does not support these; VACUUM could not run here anyway (it needs an attached database)
         return Some(proto::Error::new(
             format!("SQL string could not be parsed: unsupported statement: {text}"),
             "SQL_PARSE_ERROR",
@@ -389,7 +443,15 @@ impl ToSql for Arg<'_> {
 fn bind(st: &mut Statement, stmt: &proto::Stmt) -> Result<(), proto::Error> {
     let invalid = |m: String| proto::Error::new(format!("Arguments do not match SQL parameters: {m}"), "ARGS_INVALID");
     let named = !stmt.named_args.is_empty();
-    let provided = if named { stmt.named_args.len() } else { stmt.args.len() };
+    // like sqld: a name given twice counts once, and its last value is used
+    let provided = if named {
+        let mut names: Vec<&str> = stmt.named_args.iter().map(|a| a.name.as_str()).collect();
+        names.sort_unstable();
+        names.dedup();
+        names.len()
+    } else {
+        stmt.args.len()
+    };
     let count = st.parameter_count();
     if provided > count {
         return Err(invalid(format!(
@@ -407,7 +469,7 @@ fn bind(st: &mut Statement, stmt: &proto::Stmt) -> Result<(), proto::Error> {
         if !named {
             return None;
         }
-        stmt.named_args.iter().find(|a| a.name == name).map(|a| &a.value)
+        stmt.named_args.iter().rev().find(|a| a.name == name).map(|a| &a.value)
     };
     for index in 1..=count {
         let name = st.parameter_name(index).map(str::to_owned);
@@ -813,6 +875,104 @@ mod tests {
         );
         assert_eq!(r[0]["response"]["result"]["last_insert_rowid"], "0");
         assert_eq!(r[1]["response"]["result"]["rows"][0][0]["value"], "0");
+    }
+
+    /// Review of 0.1.0, "smaller differences", each checked against sqld 0.24.32
+    #[test]
+    fn smaller_differences_from_sqld() {
+        let (_d, c) = setup();
+        let r = json(
+            &Exec::native(&c, u64::MAX)
+                .run(&reqs(
+                    r#"[{"type":"execute","stmt":{"sql":";BEGIN"}},
+                    {"type":"execute","stmt":{"sql":"INSERT INTO t(a) VALUES ('in tx')"}},
+                    {"type":"execute","stmt":{"sql":"; ;ROLLBACK"}},
+                    {"type":"execute","stmt":{"sql":"SELECT :a, :a","named_args":[{"name":"a","value":{"type":"integer","value":"1"}},{"name":"a","value":{"type":"integer","value":"2"}}]}},
+                    {"type":"execute","stmt":{"sql":"SELECT :a","named_args":[{"name":":a","value":{"type":"integer","value":"1"}},{"name":"a","value":{"type":"integer","value":"2"}}]}},
+                    {"type":"execute","stmt":{"sql":"analyze"}},
+                    {"type":"execute","stmt":{"sql":"  ANALYZE main"}},
+                    {"type":"execute","stmt":{"sql":"WITH replace AS (SELECT 1 AS x) SELECT x FROM replace"}},
+                    {"type":"execute","stmt":{"sql":"PRAGMA threads"}},
+                    {"type":"execute","stmt":{"sql":"PRAGMA soft_heap_limit"}},
+                    {"type":"execute","stmt":{"sql":"PRAGMA threads = 2"}}]"#,
+                ))
+                .unwrap(),
+        );
+        // `;BEGIN` is BEGIN (the insert is rolled back), not two statements
+        assert_eq!(r[0]["type"], "ok", "{}", r[0]);
+        assert_eq!(r[2]["type"], "ok", "{}", r[2]);
+        assert_eq!(count(&c), 0);
+        // a name given twice counts once, its last value wins; `:a` and `a` are two
+        assert_eq!(
+            r[3]["response"]["result"]["rows"][0],
+            serde_json::json!([{"type":"integer","value":"2"},{"type":"integer","value":"2"}])
+        );
+        assert_eq!(
+            r[4]["error"]["message"],
+            "Arguments do not match SQL parameters: too many parameters, expected 1 found 2"
+        );
+        // ANALYZE is not supported (sqld's parser)
+        assert_eq!(
+            r[5]["error"],
+            serde_json::json!({"message": "SQL string could not be parsed: unsupported statement: analyze", "code": "SQL_PARSE_ERROR"})
+        );
+        assert_eq!(
+            r[6]["error"]["message"],
+            "SQL string could not be parsed: unsupported statement:   ANALYZE main"
+        );
+        let analyzed: i64 =
+            c.c.query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE name LIKE 'sqlite_stat%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(analyzed, 0);
+        // a table expression named `replace` does not make a SELECT an insert
+        assert_eq!(r[7]["response"]["result"]["affected_row_count"], 0);
+        assert_eq!(r[7]["response"]["result"]["last_insert_rowid"], serde_json::Value::Null);
+        // read-only PRAGMAs sqld answers
+        assert_eq!(r[8]["response"]["result"]["rows"][0][0]["value"], "0");
+        assert_eq!(r[9]["response"]["result"]["rows"][0][0]["value"], "0");
+        assert_eq!(r[10]["error"]["code"], "SQL_PARSE_ERROR");
+        // `close` after `close`
+        assert!(validate(&reqs(r#"[{"type":"close"},{"type":"close"}]"#), 10).is_ok());
+        assert!(
+            validate(
+                &reqs(r#"[{"type":"close"},{"type":"close"},{"type":"execute","stmt":{"sql":"SELECT 1"}}]"#),
+                10
+            )
+            .is_err()
+        );
+    }
+
+    /// Like sqld, RESPONSE_TOO_LARGE in a batch fails the batch as a whole, and the steps after it do not run
+    #[test]
+    fn a_response_too_large_ends_its_batch() {
+        let (_d, c) = setup();
+        let r = json(
+            &Exec::native(&c, 2000)
+                .run(&reqs(
+                    r#"[{"type":"batch","batch":{"steps":[{"stmt":{"sql":"INSERT INTO t(a) VALUES ('before')"}},
+                    {"stmt":{"sql":"SELECT zeroblob(5000)"}},
+                    {"condition":{"type":"error","step":1},"stmt":{"sql":"INSERT INTO t(a) VALUES ('after')"}}]}},
+                    {"type":"execute","stmt":{"sql":"SELECT 4"}}]"#,
+                ))
+                .unwrap(),
+        );
+        assert_eq!(
+            r[0],
+            serde_json::json!({"type":"error","error":{"message":"Response is too large","code":"RESPONSE_TOO_LARGE"}})
+        );
+        assert_eq!(r[1]["response"]["result"]["rows"][0][0]["value"], "4");
+        let rows: Vec<String> =
+            c.c.prepare("SELECT a FROM t")
+                .unwrap()
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+        assert_eq!(rows, ["before"]);
     }
 
     #[test]

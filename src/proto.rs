@@ -148,9 +148,10 @@ impl<'de> Deserialize<'de> for Value {
             },
             "blob" => {
                 let b = raw.base64.ok_or_else(|| missing("base64"))?;
+                // like sqld: any number of `=` at the end
                 Value::Blob(
                     BASE64
-                        .decode(b.as_bytes())
+                        .decode(b.trim_end_matches('=').as_bytes())
                         .map_err(|e| de::Error::custom(format!("bad base64: {e}")))?,
                 )
             }
@@ -315,6 +316,20 @@ mod tests {
         assert!(bad(r#"{"type":"blob","base64":"!!"}"#));
         assert!(bad(r#"{"type":"date","value":"x"}"#));
         assert!(serde_json::from_str::<PipelineReq>(r#"{"requests":[{"type":"describe"}]}"#).is_err());
+        // review of 0.1.0: sqld 0.24.32 takes any number of `=` at the end, and nothing else
+        let blob = |b: &str| serde_json::from_str::<Value>(&format!(r#"{{"type":"blob","base64":"{b}"}}"#));
+        for (b, v) in [
+            ("AAE", vec![0, 1]),
+            ("AAE=", vec![0, 1]),
+            ("AAE==", vec![0, 1]),
+            ("AAE=====", vec![0, 1]),
+            ("=", vec![]),
+        ] {
+            assert_eq!(blob(b).unwrap(), Value::Blob(v), "{b}");
+        }
+        for b in ["AA=E", "A", "A="] {
+            assert!(blob(b).is_err(), "{b}");
+        }
     }
 
     #[test]

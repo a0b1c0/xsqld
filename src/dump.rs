@@ -5,16 +5,17 @@
 //! sqlite3 shell's `.dump`), except where sqld fails: names containing `"` are quoted correctly, text that is not
 //! UTF-8 is written as `CAST(X'…' AS TEXT)` (the same bytes back), infinities are written as `1e999`.
 
-use std::ffi::CString;
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rusqlite::backup::{Backup, StepResult};
 use rusqlite::types::ValueRef;
 
 use crate::config::Config;
 use crate::conn::Conn;
+use crate::reader::ReadGate;
+use crate::sql::Completer;
 
 /// A copy of a database in `--db-path/xsqld-tmp`, removed on drop. Made with the online backup API in one read
 /// transaction (as fast as copying the file); writing SQL text to a client, which may take its time, then reads the
@@ -25,7 +26,11 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
-    pub fn take(db: &Path, cfg: &Config) -> anyhow::Result<Snapshot> {
+    /// The copy is one read transaction, so it passes the database's read gate like a read request
+    pub fn take(db: &Path, cfg: &Config, gate: &ReadGate) -> anyhow::Result<Snapshot> {
+        let Some(_pass) = gate.enter(std::time::Instant::now() + cfg.dump_max()) else {
+            anyhow::bail!("dump took longer than --dump-max-ms");
+        };
         let dir = cfg.tmp_dir();
         std::fs::create_dir_all(&dir)?;
         let mut id = [0u8; 8];
@@ -263,7 +268,8 @@ struct Escaped<'a>(&'a [u8]);
 
 impl std::fmt::Display for Escaped<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let Ok(s) = std::str::from_utf8(self.0) else {
+        // text with a NUL in it as well: written as it is, the dump cannot be loaded (by sqld neither)
+        let Some(s) = std::str::from_utf8(self.0).ok().filter(|s| !s.contains('\0')) else {
             f.write_str("CAST(X'")?;
             for b in self.0 {
                 write!(f, "{b:02x}")?;
@@ -332,6 +338,13 @@ pub enum LoadError {
         line: usize,
         words: String,
     },
+    /// A statement longer than `--dump-load-max-statement-bytes`
+    TooLong {
+        line: usize,
+        limit: usize,
+    },
+    /// The load ran past `--dump-load-timeout-ms`
+    TimedOut,
 }
 
 impl std::fmt::Display for LoadError {
@@ -345,52 +358,98 @@ impl std::fmt::Display for LoadError {
             LoadError::NotAllowed { line, words } => {
                 write!(f, "dump line {line}: `{words} …` is not a statement a dump consists of")
             }
+            LoadError::TooLong { line, limit } => write!(
+                f,
+                "dump line {line}: the statement is longer than {limit} bytes (--dump-load-max-statement-bytes)"
+            ),
+            LoadError::TimedOut => f.write_str("loading the dump took longer than --dump-load-timeout-ms"),
         }
     }
 }
 
+/// Limits of [`load`]
+pub struct LoadLimits {
+    /// Longest statement (`--dump-load-max-statement-bytes`); a longer line is refused before it is read in whole
+    pub max_statement_bytes: usize,
+    /// The whole load (`--dump-load-timeout-ms`); the connection's deadline interrupts SQL running past it
+    pub deadline: Instant,
+}
+
 /// Runs an SQL dump on an empty database. Statements end where SQLite says a statement is complete (so trigger bodies
-/// spanning lines work, unlike sqld which splits at every line ending in `;`). Like sqld: from the third statement on
-/// a transaction must be open, and none may be open at the end. Only the statements [`export`] and sqld write are run.
-pub fn load(conn: &Conn, input: impl BufRead) -> Result<(), LoadError> {
+/// spanning lines work, unlike sqld which splits at every line ending in `;`); the text of a statement is read once
+/// however many of its lines end in `;` ([`Completer`]). Like sqld: from the third statement on a transaction must
+/// be open, and none may be open at the end. Only the statements [`export`] and sqld write are run.
+///
+/// Like sqld, a view or index whose definition ends in a `--` comment loads: the dump writes it as `<sql>;`, so the
+/// `;` is inside the comment and the text never looks complete. Such a statement is run as it stands, and only
+/// when SQLite finds it incomplete is the next line taken to belong to it.
+pub fn load(conn: &Conn, input: impl BufRead, limits: &LoadLimits) -> Result<(), LoadError> {
     let mut stmt = String::new();
+    let mut ends = Completer::default();
     let mut count = 0usize;
     let mut line_no = 0usize;
     let mut input = input;
     let mut raw = Vec::new();
+    let failed = |e: LoadError| {
+        conn.rollback_all();
+        e
+    };
     loop {
+        if Instant::now() >= limits.deadline {
+            return Err(failed(LoadError::TimedOut));
+        }
         raw.clear();
-        if input.read_until(b'\n', &mut raw).map_err(LoadError::Io)? == 0 {
+        // one byte more than allowed: a longer line is refused without reading it in whole
+        let room = limits.max_statement_bytes.saturating_sub(stmt.len()) as u64 + 1;
+        let read = (&mut input).take(room).read_until(b'\n', &mut raw);
+        if read.map_err(|e| failed(LoadError::Io(e)))? == 0 {
             break;
         }
         line_no += 1;
-        let line = std::str::from_utf8(&raw).map_err(|_| LoadError::NotUtf8 { line: line_no })?;
+        if stmt.len() + raw.len() > limits.max_statement_bytes {
+            return Err(failed(LoadError::TooLong {
+                line: line_no,
+                limit: limits.max_statement_bytes,
+            }));
+        }
+        let line = std::str::from_utf8(&raw).map_err(|_| failed(LoadError::NotUtf8 { line: line_no }))?;
         if stmt.is_empty() && (line.trim().is_empty() || line.trim_start().starts_with("--")) {
             continue;
         }
+        let line_start = stmt.len();
         stmt.push_str(line);
-        if !line.trim_end().ends_with(';') || !complete(&stmt) {
+        if !line.trim_end().ends_with(';') {
             continue;
         }
-        count += 1;
+        let tentative = !ends.complete(&stmt);
+        if tentative && !(ends.trailing_line_comment().is_some_and(|c| c >= line_start) && ends.semicolon_would_end()) {
+            continue;
+        }
         if !allowed_in_dump(&stmt) {
-            conn.rollback_all();
-            return Err(LoadError::NotAllowed {
+            return Err(failed(LoadError::NotAllowed {
                 line: line_no,
                 words: crate::sql::leading_words(&stmt, 3).join(" "),
-            });
+            }));
         }
-        if count > 2 && conn.is_autocommit() {
+        if count >= 2 && conn.is_autocommit() {
             return Err(LoadError::NoTransaction);
         }
-        if let Err(e) = conn.c.execute_batch(&stmt) {
-            conn.rollback_all();
-            return Err(LoadError::Sql {
+        if let Err(e) = run_dump_statement(conn, &stmt) {
+            if tentative && e.to_string().starts_with("incomplete input") {
+                // a comment ending in `;` inside the statement: it goes on in the next line
+                continue;
+            }
+            if Instant::now() >= limits.deadline {
+                return Err(failed(LoadError::TimedOut));
+            }
+            return Err(failed(LoadError::Sql {
                 line: line_no,
                 message: e.to_string(),
-            });
+            }));
         }
+        count += 1;
         stmt.clear();
+        ends = Completer::default();
     }
     if !stmt.trim().is_empty() {
         conn.rollback_all();
@@ -404,6 +463,24 @@ pub fn load(conn: &Conn, input: impl BufRead) -> Result<(), LoadError> {
         return Err(LoadError::NoCommit);
     }
     Ok(())
+}
+
+/// Runs one statement of a dump. `DELETE FROM sqlite_sequence` is skipped when the new database has no such table:
+/// SQLite keeps `sqlite_sequence` (empty) after the last table with AUTOINCREMENT is dropped, the dump empties it,
+/// and the new database only gets one with such a table, so the dump of a database that once had one did not load
+/// (on sqld neither)
+fn run_dump_statement(conn: &Conn, stmt: &str) -> rusqlite::Result<()> {
+    if crate::sql::leading_words(stmt, 4) == ["DELETE", "FROM", "SQLITE_SEQUENCE"] {
+        let exists: bool = conn.c.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name = 'sqlite_sequence')",
+            [],
+            |r| r.get(0),
+        )?;
+        if !exists {
+            return Ok(());
+        }
+    }
+    conn.c.execute_batch(stmt)
 }
 
 /// The statements of a dump written by [`export`] or sqld: one statement each, schema (no temporary objects), rows,
@@ -428,14 +505,6 @@ fn allowed_in_dump(stmt: &str) -> bool {
             | ["DELETE", "FROM", "SQLITE_SEQUENCE"]
             | ["ANALYZE", "SQLITE_SCHEMA"]
     )
-}
-
-fn complete(sql: &str) -> bool {
-    match CString::new(sql) {
-        // SAFETY: a valid NUL-terminated string that outlives the call
-        Ok(c) => unsafe { rusqlite::ffi::sqlite3_complete(c.as_ptr()) != 0 },
-        Err(_) => true,
-    }
 }
 
 #[cfg(test)]
@@ -466,6 +535,136 @@ mod tests {
         String::from_utf8(out).unwrap()
     }
 
+    fn load_all(c: &Conn, text: &str) -> Result<(), LoadError> {
+        let limits = LoadLimits {
+            max_statement_bytes: 1 << 30,
+            deadline: Instant::now() + Duration::from_secs(600),
+        };
+        load(c, text.as_bytes(), &limits)
+    }
+
+    /// Exports `setup` and loads the dump into a new database; returns the dump and the error of the load
+    fn round_trip(setup: &str) -> (String, Result<(), LoadError>, tempfile::TempDir, Conn) {
+        let (_d, c, cfg) = db();
+        c.c.execute_batch(setup).unwrap();
+        let text = dump(&c);
+        let dir2 = tempfile::tempdir().unwrap();
+        let c2 = Conn::open_loader(&dir2.path().join("data"), &cfg).unwrap();
+        let r = load_all(&c2, &text);
+        (text, r, dir2, c2)
+    }
+
+    /// Review of 0.1.0: a view or index definition ending in a `--` comment is written as `<sql> -- c;`; sqld loads
+    /// that, xsqld waited for the end of a statement that never came
+    #[test]
+    fn definitions_ending_in_a_line_comment_load_back() {
+        let (text, r, _d, c2) = round_trip(
+            "CREATE TABLE t(a, b);
+             CREATE VIEW v AS SELECT a FROM t -- the view;
+             ;
+             CREATE INDEX i ON t(a) -- the index
+             ;
+             CREATE TABLE u(
+               a INTEGER, -- not the end;
+               b TEXT
+             );
+             CREATE VIEW w AS SELECT a, -- still going;
+               b FROM t;
+             CREATE TRIGGER tr AFTER INSERT ON t BEGIN
+               UPDATE t SET b = 1; -- inside;
+             END;
+             INSERT INTO t VALUES (1, 2);",
+        );
+        assert!(text.contains("FROM t -- the view;\n"), "{text}");
+        r.unwrap_or_else(|e| panic!("{e}\n{text}"));
+        assert_eq!(dump(&c2), text);
+        let objects: i64 =
+            c2.c.query_row("SELECT count(*) FROM sqlite_schema", [], |r| r.get(0))
+                .unwrap();
+        assert_eq!(objects, 6);
+    }
+
+    /// Review of 0.1.0: text with a NUL in it was written as it is, and such a dump did not load (sqld: the same)
+    #[test]
+    fn text_with_nul_round_trips() {
+        let (text, r, _d, c2) = round_trip("CREATE TABLE n(v); INSERT INTO n VALUES ('a' || char(0) || 'b');");
+        assert!(text.contains("CAST(X'610062' AS TEXT)"), "{text}");
+        r.unwrap();
+        let (t, h): (String, String) =
+            c2.c.query_row("SELECT typeof(v), hex(v) FROM n", [], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap();
+        assert_eq!((t.as_str(), h.as_str()), ("text", "610062"));
+    }
+
+    /// Review of 0.1.0: SQLite keeps `sqlite_sequence` after its last AUTOINCREMENT table is dropped; the dump then
+    /// empties a table the new database does not have, and did not load (sqld: the same)
+    #[test]
+    fn a_leftover_sqlite_sequence_loads_back() {
+        let (text, r, _d, c2) = round_trip(
+            "CREATE TABLE a(id INTEGER PRIMARY KEY AUTOINCREMENT); INSERT INTO a DEFAULT VALUES; DROP TABLE a;
+             CREATE TABLE b(v); INSERT INTO b VALUES (1);",
+        );
+        assert!(text.contains("DELETE FROM sqlite_sequence;\n"), "{text}");
+        r.unwrap();
+        assert_eq!(
+            c2.c.query_row("SELECT v FROM b", [], |r| r.get::<_, i64>(0)).unwrap(),
+            1
+        );
+        // with a table that has AUTOINCREMENT, the sequence is restored as before
+        let (_, r, _d, c2) = round_trip(
+            "CREATE TABLE s(id INTEGER PRIMARY KEY AUTOINCREMENT); INSERT INTO s VALUES (41); DELETE FROM s;",
+        );
+        r.unwrap();
+        let seq: i64 =
+            c2.c.query_row("SELECT seq FROM sqlite_sequence WHERE name = 's'", [], |r| r.get(0))
+                .unwrap();
+        assert_eq!(seq, 41);
+    }
+
+    /// Review of 0.1.0: loading had no limits (one line of hundreds of MB, a statement that runs for ever)
+    #[test]
+    fn a_dump_beyond_the_limits_fails() {
+        let head = "PRAGMA foreign_keys=OFF;\nBEGIN TRANSACTION;\nCREATE TABLE z(x);\n";
+        let (_d, c) = loader();
+        let limits = LoadLimits {
+            max_statement_bytes: 4096,
+            deadline: Instant::now() + Duration::from_secs(600),
+        };
+        // a statement within the limit, then one line far beyond it, which is not read in whole
+        let long = format!(
+            "{head}INSERT INTO z VALUES('{}');\nINSERT INTO z VALUES('{}');\nCOMMIT;\n",
+            "a".repeat(4000),
+            "b".repeat(1 << 20)
+        );
+        let mut input = std::io::BufReader::with_capacity(1024, std::io::Cursor::new(long.as_bytes()));
+        let e = load(&c, &mut input, &limits).unwrap_err();
+        assert!(matches!(e, LoadError::TooLong { line: 5, limit: 4096 }), "{e}");
+        let line5 = long.find("INSERT INTO z VALUES('b").unwrap() as u64;
+        assert!(
+            input.get_ref().position() <= line5 + 4097 + 1024,
+            "read on past the limit"
+        );
+        assert!(c.is_autocommit());
+        // the same over several lines of one statement
+        let lines = format!("{head}CREATE VIEW v AS SELECT\n{}1;\nCOMMIT;\n", "1 +\n".repeat(2000));
+        let e = load(&c, lines.as_bytes(), &limits).unwrap_err();
+        assert!(matches!(e, LoadError::TooLong { .. }), "{e}");
+        // a statement that would run for ever is interrupted at the deadline
+        let started = Instant::now();
+        let forever = format!(
+            "{head}INSERT INTO z WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n) SELECT i FROM n;\nCOMMIT;\n"
+        );
+        c.set_deadline(Some(started + Duration::from_millis(200)));
+        let limits = LoadLimits {
+            max_statement_bytes: 1 << 20,
+            deadline: started + Duration::from_millis(200),
+        };
+        let e = load(&c, forever.as_bytes(), &limits).unwrap_err();
+        assert!(matches!(e, LoadError::TimedOut), "{e}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(c.is_autocommit());
+    }
+
     /// Output of sqld 0.24.32 for the same database (`GET /dump`, captured 2026-11-10)
     const SQLD_OUTPUT: &str = include_str!("../tests/fixtures/sqld-0.24.32-dump.sql");
 
@@ -488,7 +687,7 @@ mod tests {
         let text = dump(&c);
         let dir2 = tempfile::tempdir().unwrap();
         let c2 = Conn::open_loader(&dir2.path().join("data"), &cfg).unwrap();
-        load(&c2, text.as_bytes()).unwrap();
+        load_all(&c2, &text).unwrap();
         assert_eq!(dump(&c2), text);
         let seq: i64 =
             c2.c.query_row("SELECT seq FROM sqlite_sequence WHERE name = 'a'", [], |r| r.get(0))
@@ -499,23 +698,15 @@ mod tests {
     #[test]
     fn load_requires_a_transaction() {
         let (_d, c) = loader();
-        let e = load(
-            &c,
-            "CREATE TABLE a(x);\nCREATE TABLE b(x);\nCREATE TABLE c(x);\n".as_bytes(),
-        )
-        .unwrap_err();
+        let e = load_all(&c, "CREATE TABLE a(x);\nCREATE TABLE b(x);\nCREATE TABLE c(x);\n").unwrap_err();
         assert!(matches!(e, LoadError::NoTransaction));
-        let e = load(
-            &c,
-            "PRAGMA foreign_keys=OFF;\nBEGIN TRANSACTION;\nCREATE TABLE d(x);\n".as_bytes(),
-        )
-        .unwrap_err();
+        let e = load_all(&c, "PRAGMA foreign_keys=OFF;\nBEGIN TRANSACTION;\nCREATE TABLE d(x);\n").unwrap_err();
         assert!(matches!(e, LoadError::NoCommit));
         assert!(c.is_autocommit());
-        let e = load(&c, "BEGIN;\nATTACH 'x' AS y;\nCOMMIT;\n".as_bytes()).unwrap_err();
+        let e = load_all(&c, "BEGIN;\nATTACH 'x' AS y;\nCOMMIT;\n").unwrap_err();
         assert!(matches!(e, LoadError::NotAllowed { line: 2, .. }), "{e}");
         let ok = "-- comment\n\nPRAGMA foreign_keys=OFF;\nBEGIN TRANSACTION;\nCREATE TABLE IF NOT EXISTS z(x);\nINSERT INTO z VALUES(1);\nCOMMIT;\n";
-        load(&c, ok.as_bytes()).unwrap();
+        load_all(&c, ok).unwrap();
     }
 
     #[test]
@@ -531,7 +722,7 @@ mod tests {
         );
         let dir2 = tempfile::tempdir().unwrap();
         let c2 = Conn::open_loader(&dir2.path().join("data"), &cfg).unwrap();
-        load(&c2, text.as_bytes()).unwrap();
+        load_all(&c2, &text).unwrap();
         let back: Vec<(String, String)> =
             c2.c.prepare("SELECT typeof(v), hex(v) FROM b ORDER BY rowid")
                 .unwrap()
@@ -561,7 +752,7 @@ mod tests {
             "SELECT 1;\n",
             "VACUUM;\n",
         ] {
-            let e = load(&c, format!("{head}{bad}COMMIT;\n").as_bytes()).unwrap_err();
+            let e = load_all(&c, &format!("{head}{bad}COMMIT;\n")).unwrap_err();
             assert!(matches!(e, LoadError::NotAllowed { line: 4, .. }), "{bad}: {e}");
             assert!(c.is_autocommit(), "{bad}");
         }
@@ -571,7 +762,7 @@ mod tests {
              CREATE TABLE s(id INTEGER PRIMARY KEY AUTOINCREMENT);\nINSERT INTO z VALUES(1);\n\
              DELETE FROM sqlite_sequence;\nINSERT INTO sqlite_sequence VALUES('s',5);\nANALYZE sqlite_schema;\nCOMMIT;\n"
         );
-        load(&c, ok.as_bytes()).unwrap();
+        load_all(&c, &ok).unwrap();
     }
 
     #[test]

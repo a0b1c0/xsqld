@@ -2,17 +2,21 @@
 //! writer and never block it (WAL). A request runs here only if every statement is read-only by
 //! `sqlite3_stmt_readonly()`; otherwise, or if it would leave a transaction open, it goes to the write thread (it has
 //! changed nothing, so running it again there is safe).
+//!
+//! Every read request passes the database's [`ReadGate`] before it starts, which the write thread closes for a
+//! moment when the WAL cannot be restarted otherwise (checkpoint starvation, see [`ReadGate`]).
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 use tokio::sync::Semaphore;
 
 use crate::config::Config;
 use crate::conn::Conn;
 use crate::exec::{self, Exec, Results};
+use crate::metrics::DbMetrics;
 use crate::proto::StreamRequest;
 use crate::sql::{self, Begin, Kind};
 
@@ -21,6 +25,106 @@ pub struct Readers {
     cfg: Arc<Config>,
     idle: Mutex<Vec<Conn>>,
     permits: Arc<Semaphore>,
+    pub gate: Arc<ReadGate>,
+}
+
+/// Holds back new read transactions of one database while the write thread runs a RESTART checkpoint that keeps
+/// failing because of readers (checkpoint starvation).
+///
+/// Why: SQLite starts the WAL over only once no read transaction uses it. Reads that follow each other closely,
+/// while writes go on, always leave one reader on the WAL, so without help the WAL grows for as long as that
+/// pattern lasts. With the gate closed no read starts, the write thread waits for the reads already running to end
+/// (at most `--checkpoint-reader-wait-ms`) and then restarts the WAL; reads that start once every frame is in the
+/// database file do not use the WAL at all, so opening the gate again does not undo it.
+///
+/// Bounds: the write thread keeps the gate closed for at most `--checkpoint-reader-wait-ms` plus the time of one
+/// RESTART, and only when the RESTART before it failed; after a closed-gate RESTART that still failed (a read ran
+/// longer than the wait), the gate stays open for at least four times that wait before the next try. So a read
+/// request is held back at most once per try and never past its own deadline, and reads are never held back for
+/// more than about a fifth of the time. Nothing a read does is refused or changed: it only starts later.
+pub struct ReadGate {
+    state: Mutex<GateState>,
+    changed: Condvar,
+    metrics: Arc<DbMetrics>,
+}
+
+#[derive(Default)]
+struct GateState {
+    closed: bool,
+    /// Read requests between [`ReadGate::enter`] and the end of their work
+    active: usize,
+}
+
+/// A read request that passed the gate; ends its share when dropped
+pub struct ReadPass<'g>(&'g ReadGate);
+
+impl Drop for ReadPass<'_> {
+    fn drop(&mut self) {
+        let mut st = self.0.state.lock();
+        st.active -= 1;
+        if st.active == 0 {
+            self.0.changed.notify_all();
+        }
+    }
+}
+
+/// The gate, closed; opened again when dropped
+pub struct ClosedGate<'g>(&'g ReadGate);
+
+impl Drop for ClosedGate<'_> {
+    fn drop(&mut self) {
+        self.0.state.lock().closed = false;
+        self.0.changed.notify_all();
+    }
+}
+
+impl ClosedGate<'_> {
+    /// Waits until no read request that passed the gate before it closed is still running, at most `wait`;
+    /// returns whether they all ended
+    pub fn drain(&self, wait: Duration) -> bool {
+        let until = Instant::now() + wait;
+        let mut st = self.0.state.lock();
+        while st.active > 0 {
+            if self.0.changed.wait_until(&mut st, until).timed_out() {
+                return st.active == 0;
+            }
+        }
+        true
+    }
+}
+
+impl ReadGate {
+    pub fn new(metrics: Arc<DbMetrics>) -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(GateState::default()),
+            changed: Condvar::new(),
+            metrics,
+        })
+    }
+
+    /// Lets a read request in, waiting while the gate is closed; None if `deadline` came first. Blocking: called on
+    /// the read's own blocking thread.
+    pub fn enter(&self, deadline: Instant) -> Option<ReadPass<'_>> {
+        let mut st = self.state.lock();
+        if st.closed {
+            let started = Instant::now();
+            while st.closed {
+                if self.changed.wait_until(&mut st, deadline).timed_out() && st.closed {
+                    self.metrics.read_gate_wait.record(started.elapsed());
+                    return None;
+                }
+            }
+            self.metrics.read_gate_wait.record(started.elapsed());
+        }
+        st.active += 1;
+        Some(ReadPass(self))
+    }
+
+    /// Closes the gate: read requests arriving from now on wait until the returned guard is dropped
+    pub fn close(&self) -> ClosedGate<'_> {
+        self.state.lock().closed = true;
+        ClosedGate(self)
+    }
 }
 
 pub enum ReadOutcome {
@@ -34,13 +138,14 @@ pub enum ReadOutcome {
 }
 
 impl Readers {
-    pub fn new(path: PathBuf, cfg: Arc<Config>) -> Self {
+    pub fn new(path: PathBuf, cfg: Arc<Config>, gate: Arc<ReadGate>) -> Self {
         let n = cfg.read_pool_size;
         Self {
             path,
             cfg,
             idle: Mutex::new(Vec::with_capacity(n)),
             permits: Arc::new(Semaphore::new(n)),
+            gate,
         }
     }
 
@@ -52,6 +157,9 @@ impl Readers {
         let this = self.clone();
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
+            let Some(_pass) = this.gate.enter(deadline) else {
+                return Ok(ReadOutcome::Deadline);
+            };
             let conn = match this.idle.lock().pop() {
                 Some(c) => c,
                 None => Conn::open_reader(&this.path, &this.cfg)?,
@@ -86,7 +194,7 @@ fn run_read(conn: &Conn, requests: Vec<StreamRequest>, deadline: Instant, budget
     let mut ex = Exec::native(conn, budget);
     let results = match ex.run(&requests) {
         Ok(r) => r,
-        Err(exec::GroupLost) => unreachable!("native execution has no group"),
+        Err(_) => unreachable!("native execution has no group"),
     };
     conn.set_deadline(None);
     if !conn.is_autocommit() {
@@ -117,7 +225,8 @@ mod tests {
         let w = Conn::open_writer(&path, &cfg).unwrap();
         w.c.execute_batch("CREATE TABLE t(a); INSERT INTO t VALUES (1), (2);")
             .unwrap();
-        (dir, Arc::new(Readers::new(path, cfg)), w)
+        let gate = ReadGate::new(Arc::new(DbMetrics::default()));
+        (dir, Arc::new(Readers::new(path, cfg, gate)), w)
     }
 
     fn later() -> Instant {

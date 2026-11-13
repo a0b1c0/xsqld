@@ -24,6 +24,7 @@ pub enum Kind {
     Attach,
     Detach,
     Vacuum,
+    Analyze,
     Insert,
     Update,
     Delete,
@@ -147,6 +148,7 @@ impl<'a> Lexer<'a> {
             }
             b'(' => Some(Tok::Open),
             b')' => Some(Tok::Close),
+            b',' => Some(Tok::Comma),
             _ => Some(Tok::Other),
         }
     }
@@ -157,14 +159,19 @@ enum Tok {
     Word(String),
     Open,
     Close,
+    Comma,
     Other,
 }
 
 /// The statement text as it is handed to SQLite: without the Unicode whitespace around it (U+00A0, U+3000, …, which
 /// SQLite's tokenizer does not take for whitespace). The statement cache of rusqlite trims its key the same way;
 /// trimming here keeps cached and uncached statements, and the classification below, on the same text.
+///
+/// Empty statements in front (`;BEGIN`) are dropped too, as sqld drops them: compiled as it stands, SQLite would
+/// compile the empty statement only and leave the rest unrun.
 pub fn trimmed(sql: &str) -> &str {
     sql.trim()
+        .trim_start_matches(|c: char| c == ';' || c.is_ascii_whitespace())
 }
 
 /// Tests only: text starting with this is classified as an ordinary statement whatever follows, which stands for a
@@ -188,9 +195,13 @@ pub fn classify(sql: &str) -> Kind {
         }),
         "COMMIT" | "END" => Kind::Commit,
         "ROLLBACK" => {
+            // ROLLBACK [TRANSACTION [name]] [TO [SAVEPOINT] savepoint]
             let mut t = lx.next();
             if matches!(&t, Some(Tok::Word(m)) if m == "TRANSACTION") {
                 t = lx.next();
+                if matches!(&t, Some(Tok::Word(m)) if m != "TO") || t == Some(Tok::Other) {
+                    t = lx.next();
+                }
             }
             if matches!(&t, Some(Tok::Word(m)) if m == "TO") {
                 Kind::RollbackTo
@@ -204,6 +215,7 @@ pub fn classify(sql: &str) -> Kind {
         "ATTACH" => Kind::Attach,
         "DETACH" => Kind::Detach,
         "VACUUM" => Kind::Vacuum,
+        "ANALYZE" => Kind::Analyze,
         "INSERT" | "REPLACE" => Kind::Insert,
         "UPDATE" => Kind::Update,
         "DELETE" => Kind::Delete,
@@ -213,13 +225,18 @@ pub fn classify(sql: &str) -> Kind {
     }
 }
 
-/// `WITH … AS (…) <main statement>`: the first statement keyword outside parentheses
+/// `WITH [RECURSIVE] name AS (…) [, name AS (…)] <main statement>`: the first statement keyword outside parentheses
+/// that is not the name of a table expression (`WITH replace AS (…) SELECT …` is a SELECT)
 fn with_body(lx: &mut Lexer) -> Kind {
     let mut depth = 0usize;
+    let mut name_next = true;
     while let Some(t) = lx.next() {
         match t {
             Tok::Open => depth += 1,
             Tok::Close => depth = depth.saturating_sub(1),
+            Tok::Comma if depth == 0 => name_next = true,
+            Tok::Word(w) if depth == 0 && name_next => name_next = w == "RECURSIVE",
+            Tok::Other if depth == 0 && name_next => name_next = false,
             Tok::Word(w) if depth == 0 => match w.as_str() {
                 "SELECT" | "VALUES" => return Kind::Select,
                 "INSERT" | "REPLACE" => return Kind::Insert,
@@ -248,104 +265,220 @@ pub fn leading_words(sql: &str, n: usize) -> Vec<String> {
     out
 }
 
+// Tokens of `sqlite3_complete` (SQLite's `complete.c`)
+const SEMI: usize = 0;
+const WS: usize = 1;
+const OTHER: usize = 2;
+const EXPLAIN: usize = 3;
+const CREATE: usize = 4;
+const TEMP: usize = 5;
+const TRIGGER: usize = 6;
+const END: usize = 7;
+/// Its state machine. States: 0 nothing seen, 1 a statement just ended, 2 inside a statement, 3 after EXPLAIN, 4 after
+/// CREATE [TEMP], 5 inside a trigger, 6 after `;` inside a trigger, 7 after `; END` inside a trigger. Whitespace
+/// (comments included) never changes the state.
+const NEXT: [[u8; 8]; 8] = [
+    [1, 0, 2, 3, 4, 2, 2, 2],
+    [1, 1, 2, 3, 4, 2, 2, 2],
+    [1, 2, 2, 2, 2, 2, 2, 2],
+    [1, 3, 3, 2, 4, 2, 2, 2],
+    [1, 4, 2, 2, 2, 4, 5, 2],
+    [6, 5, 5, 5, 5, 5, 5, 5],
+    [6, 6, 5, 5, 5, 5, 5, 7],
+    [1, 7, 5, 5, 5, 5, 5, 5],
+];
+
+/// A token of `sqlite3_complete`'s tokenizer
+enum CompleteTok {
+    /// The token and where the next one starts
+    Done(usize, usize),
+    /// A quoted text or block comment (`token`) still open at the end of the text: it ends at the next `close`,
+    /// searched for from `body` on
+    Open {
+        token: usize,
+        close: &'static [u8],
+        body: usize,
+    },
+}
+
+/// The token of `sqlite3_complete` starting at `i` (< the length of `s`)
+fn complete_token(s: &[u8], i: usize) -> CompleteTok {
+    let id_char = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'$' || c >= 0x80;
+    let closed =
+        |token: usize, close: &'static [u8], body: usize| match s[body..].windows(close.len()).position(|w| w == close)
+        {
+            Some(p) => CompleteTok::Done(token, body + p + close.len()),
+            None => CompleteTok::Open { token, close, body },
+        };
+    match s[i] {
+        b';' => CompleteTok::Done(SEMI, i + 1),
+        b' ' | b'\r' | b'\t' | b'\n' | 0x0C => CompleteTok::Done(WS, i + 1),
+        b'/' if s.get(i + 1) == Some(&b'*') => closed(WS, b"*/", i + 2),
+        b'-' if s.get(i + 1) == Some(&b'-') => {
+            let end = s[i..].iter().position(|&c| c == b'\n').map_or(s.len(), |p| i + p);
+            CompleteTok::Done(WS, end)
+        }
+        // a quoted text ends at the next quote character (a doubled quote reads as two texts: the same ends)
+        b'[' => closed(OTHER, b"]", i + 1),
+        b'\'' => closed(OTHER, b"'", i + 1),
+        b'"' => closed(OTHER, b"\"", i + 1),
+        b'`' => closed(OTHER, b"`", i + 1),
+        c if id_char(c) => {
+            let end = s[i..].iter().position(|&c| !id_char(c)).map_or(s.len(), |p| i + p);
+            let word = &s[i..end];
+            let is = |kw: &str| word.eq_ignore_ascii_case(kw.as_bytes());
+            let token = if is("create") {
+                CREATE
+            } else if is("trigger") {
+                TRIGGER
+            } else if is("temp") || is("temporary") {
+                TEMP
+            } else if is("end") {
+                END
+            } else if is("explain") {
+                EXPLAIN
+            } else {
+                OTHER
+            };
+            CompleteTok::Done(token, end)
+        }
+        _ => CompleteTok::Done(OTHER, i + 1),
+    }
+}
+
+/// Where the statement SQLite compiles starts: past the Unicode whitespace [`trimmed`] removes and the byte order
+/// marks and whitespace SQLite's tokenizer skips in front of it. `sqlite3_complete` would read a byte order mark, or
+/// U+00A0 left in front, as part of a name, and so miss the `CREATE TRIGGER` behind it.
+fn statement_start(sql: &str) -> &str {
+    let mut s = trimmed(sql);
+    loop {
+        s = s.trim_start_matches([' ', '\r', '\t', '\n', '\x0c']);
+        match s.strip_prefix('\u{feff}') {
+            // Unicode whitespace behind it is part of a name for SQLite
+            Some(rest) => s = rest,
+            None => return s,
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Bytes [`many_statements`] has looked at on this thread
+    static SCANNED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// More than one statement in the text (sqld refuses these before running anything): the first `;` that ends a
 /// statement is followed by something other than whitespace, comments and semicolons. Where a statement ends is
 /// decided the way `sqlite3_complete` decides it (a `;` inside `CREATE TRIGGER … BEGIN … END` does not end one), with
 /// its state machine run once over the text: asking `sqlite3_complete` at every `;` reads the text from the start each
-/// time, seconds of CPU for a trigger body of a few hundred thousand semicolons.
+/// time, seconds of CPU for a trigger body of a few hundred thousand semicolons. The text is the one SQLite compiles
+/// ([`statement_start`]).
 pub fn many_statements(sql: &str) -> bool {
-    // tokens of sqlite3_complete
-    const SEMI: usize = 0;
-    const WS: usize = 1;
-    const OTHER: usize = 2;
-    const EXPLAIN: usize = 3;
-    const CREATE: usize = 4;
-    const TEMP: usize = 5;
-    const TRIGGER: usize = 6;
-    const END: usize = 7;
-    // its states: 0 nothing seen, 1 a statement just ended, 2 inside a statement, 3 after EXPLAIN, 4 after CREATE
-    // [TEMP], 5 inside a trigger, 6 after `;` inside a trigger, 7 after `; END` inside a trigger
-    const NEXT: [[u8; 8]; 8] = [
-        [1, 0, 2, 3, 4, 2, 2, 2],
-        [1, 1, 2, 3, 4, 2, 2, 2],
-        [1, 2, 2, 2, 2, 2, 2, 2],
-        [1, 3, 3, 2, 4, 2, 2, 2],
-        [1, 4, 2, 2, 2, 4, 5, 2],
-        [6, 5, 5, 5, 5, 5, 5, 5],
-        [6, 6, 5, 5, 5, 5, 5, 7],
-        [1, 7, 5, 5, 5, 5, 5, 5],
-    ];
-    let id_char = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'$' || c >= 0x80;
+    let body = statement_start(sql);
     // SQLite reads the text up to the first NUL: no statement ends after it
-    let all = sql.as_bytes();
+    let all = body.as_bytes();
     let s = &all[..all.iter().position(|&c| c == 0).unwrap_or(all.len())];
     let (mut state, mut i) = (0usize, 0usize);
     while i < s.len() {
-        let token = match s[i] {
-            b';' => {
-                i += 1;
-                SEMI
-            }
-            b' ' | b'\r' | b'\t' | b'\n' | 0x0C => {
-                i += 1;
-                WS
-            }
-            b'/' if s.get(i + 1) == Some(&b'*') => match s[i + 2..].windows(2).position(|w| w == b"*/") {
-                Some(p) => {
-                    i += p + 4;
-                    WS
-                }
-                None => return false,
-            },
-            b'-' if s.get(i + 1) == Some(&b'-') => {
-                while i < s.len() && s[i] != b'\n' {
-                    i += 1;
-                }
-                WS
-            }
-            // a quoted text ends at the next quote character (a doubled quote reads as two texts: the same ends)
-            c @ (b'[' | b'\'' | b'"' | b'`') => {
-                let close = if c == b'[' { b']' } else { c };
-                match s[i + 1..].iter().position(|&b| b == close) {
-                    Some(p) => {
-                        i += p + 2;
-                        OTHER
-                    }
-                    None => return false,
-                }
-            }
-            c if id_char(c) => {
-                let start = i;
-                while i < s.len() && id_char(s[i]) {
-                    i += 1;
-                }
-                let word = &s[start..i];
-                let is = |kw: &str| word.eq_ignore_ascii_case(kw.as_bytes());
-                if is("create") {
-                    CREATE
-                } else if is("trigger") {
-                    TRIGGER
-                } else if is("temp") || is("temporary") {
-                    TEMP
-                } else if is("end") {
-                    END
-                } else if is("explain") {
-                    EXPLAIN
-                } else {
-                    OTHER
-                }
-            }
-            _ => {
-                i += 1;
-                OTHER
-            }
+        let CompleteTok::Done(token, next) = complete_token(s, i) else {
+            return false;
         };
+        #[cfg(test)]
+        SCANNED.with(|n| n.set(n.get() + next - i));
+        i = next;
         state = NEXT[state][token] as usize;
         if token == SEMI && state == 1 {
-            return classify(&sql[i..]) != Kind::Empty;
+            return classify(&body[i..]) != Kind::Empty;
         }
     }
     false
+}
+
+/// Says whether SQL text that grows by appending ends with a complete statement, as `sqlite3_complete` says of the
+/// whole text, without reading again what it has read before (a dump's trigger of many lines was read from its start
+/// at every line ending in `;`). Used on text that only grows; start a new one for the next statement.
+#[derive(Default)]
+pub struct Completer {
+    state: usize,
+    /// Where reading goes on: the next token, or inside the open quoted text or comment
+    pos: usize,
+    /// A quoted text or block comment is open: its token and closing characters
+    open: Option<(usize, &'static [u8])>,
+    /// Length of the text the last time
+    len: usize,
+    /// Start of a `--` comment that only whitespace follows
+    line_comment: Option<usize>,
+    /// Bytes looked at in all (tests)
+    pub scanned: usize,
+}
+
+impl Completer {
+    /// `text`: the text of the previous call with more appended
+    pub fn complete(&mut self, text: &str) -> bool {
+        let s = text.as_bytes();
+        // like sqlite3_complete on a C string; the statement is then run, and reports the NUL
+        if s[self.len.min(s.len())..].contains(&0) {
+            return true;
+        }
+        self.len = s.len();
+        loop {
+            if let Some((token, close)) = self.open {
+                match s[self.pos..].windows(close.len()).position(|w| w == close) {
+                    Some(p) => {
+                        self.scanned += p + close.len();
+                        self.pos += p + close.len();
+                        self.state = NEXT[self.state][token] as usize;
+                        self.open = None;
+                        if token != WS {
+                            self.line_comment = None;
+                        }
+                    }
+                    None => {
+                        // the closing characters may start in what is still to come
+                        let resume = s.len().saturating_sub(close.len() - 1).max(self.pos);
+                        self.scanned += resume - self.pos;
+                        self.pos = resume;
+                        return false;
+                    }
+                }
+                continue;
+            }
+            if self.pos >= s.len() {
+                return self.state == 1;
+            }
+            match complete_token(s, self.pos) {
+                CompleteTok::Open { token, close, body } => {
+                    self.scanned += body - self.pos;
+                    self.open = Some((token, close));
+                    self.pos = body;
+                }
+                CompleteTok::Done(token, next) => {
+                    self.scanned += next - self.pos;
+                    if next == s.len() && token != SEMI {
+                        // a word, a space or a `--` comment may go on in the next piece: read it again then
+                        return NEXT[self.state][token] == 1;
+                    }
+                    if s[self.pos..].starts_with(b"--") {
+                        self.line_comment = Some(self.pos);
+                    } else if token != WS {
+                        self.line_comment = None;
+                    }
+                    self.state = NEXT[self.state][token] as usize;
+                    self.pos = next;
+                }
+            }
+        }
+    }
+
+    /// The text ends in a `--` comment starting at this offset, followed by whitespace only
+    pub fn trailing_line_comment(&self) -> Option<usize> {
+        self.line_comment
+    }
+
+    /// A `;` after the text would end a statement (one was begun, and it is not a trigger, whose body needs `END`)
+    pub fn semicolon_would_end(&self) -> bool {
+        self.open.is_none() && !matches!(self.state, 0 | 1) && NEXT[self.state][SEMI] == 1
+    }
 }
 
 /// Error of preparing a statement: syntax problems become sqld's `SQL_PARSE_ERROR` (sqld finds them with its own
@@ -469,6 +602,11 @@ mod tests {
         assert_eq!(classify("ROLLBACK TRANSACTION"), Kind::Rollback);
         assert_eq!(classify("ROLLBACK TO sp"), Kind::RollbackTo);
         assert_eq!(classify("rollback transaction to savepoint sp"), Kind::RollbackTo);
+        // review of 0.1.0: the transaction may be named
+        assert_eq!(classify("ROLLBACK TRANSACTION t TO sp"), Kind::RollbackTo);
+        assert_eq!(classify("ROLLBACK TRANSACTION \"t\" TO SAVEPOINT sp"), Kind::RollbackTo);
+        assert_eq!(classify("ROLLBACK TRANSACTION t"), Kind::Rollback);
+        assert!(classify("rollback transaction [t] to sp").needs_solo());
         assert_eq!(classify("SAVEPOINT a"), Kind::Savepoint);
         assert_eq!(classify("PRAGMA defer_foreign_keys = ON"), Kind::Pragma);
         assert_eq!(classify("INSERT INTO t VALUES (1)"), Kind::Insert);
@@ -613,6 +751,8 @@ mod tests {
                 Err(_) => false,
             }
         }
+        // on the same text: what SQLite compiles, not what sqlite3_complete would make of a byte order mark in front
+        let sql = statement_start(sql);
         let s = sql.as_bytes();
         let mut i = 0;
         while i < s.len() {
@@ -715,20 +855,121 @@ mod tests {
         }
     }
 
-    /// Review of 0.1.0, finding 4: a trigger body of semicolons took time quadratic in its length
+    /// Review of 0.1.0, finding 4: a trigger body of semicolons took time quadratic in its length. Counted in bytes
+    /// looked at, not in time
     #[test]
     fn statement_count_reads_the_text_once() {
+        let scanned = || SCANNED.with(|n| n.replace(0));
         let mut sql = String::from("CREATE TRIGGER tr AFTER INSERT ON t BEGIN ");
         sql.push_str(&";".repeat(4 * 1024 * 1024));
-        let started = std::time::Instant::now();
+        scanned();
         assert!(!many_statements(&sql));
+        assert_eq!(scanned(), sql.len());
         sql.push_str("END; SELECT 1");
         assert!(many_statements(&sql));
+        assert_eq!(scanned(), sql.len() - " SELECT 1".len());
+    }
+
+    /// Review of 0.1.0: a trigger whose text starts with Unicode whitespace or a byte order mark was counted as many
+    /// statements (`sqlite3_complete` reads them as part of a name and misses `CREATE TRIGGER`), and refused
+    #[test]
+    fn a_trigger_behind_whitespace_sqlite_skips_is_one_statement() {
+        let c = rusqlite::Connection::open_in_memory().unwrap();
+        c.execute_batch("CREATE TABLE t(a)").unwrap();
+        let trigger = "CREATE TRIGGER tr AFTER INSERT ON t BEGIN SELECT 1; SELECT 2; END";
+        for prefix in [
+            "",
+            "\u{a0}",
+            "\u{3000}",
+            "\u{2003} \n",
+            "\u{feff}",
+            " \u{feff}\t",
+            "\u{a0}\u{feff}",
+        ] {
+            let sql = format!("{prefix}{trigger}\u{a0}");
+            assert!(!many_statements(&sql), "{prefix:?}");
+            assert!(many_statements(&format!("{prefix}{trigger}; SELECT 3")), "{prefix:?}");
+            // what SQLite makes of the same text: one statement
+            let st = c.prepare(trimmed(&sql)).unwrap();
+            drop(st);
+        }
+        // Unicode whitespace behind a byte order mark is part of a name for SQLite: not a trigger
+        assert!(many_statements(
+            "\u{feff}\u{a0}CREATE TRIGGER tr AFTER INSERT ON t BEGIN SELECT 1; END"
+        ));
+    }
+
+    fn complete_c(sql: &str) -> bool {
+        match std::ffi::CString::new(sql) {
+            // SAFETY: a valid NUL-terminated string that outlives the call
+            Ok(c) => unsafe { rusqlite::ffi::sqlite3_complete(c.as_ptr()) != 0 },
+            Err(_) => true,
+        }
+    }
+
+    /// The text given to a [`Completer`] in pieces gets the answers `sqlite3_complete` gives for the whole text so far
+    #[test]
+    fn completer_agrees_with_sqlite3_complete() {
+        const PIECES: &[&str] = &[
+            "[", "]", "'", "\"", "`", ";", ";", "-", "--", "/", "*", "/*", "*/", "(", " ", "\n", "\n", "x", "é",
+            "CREATE", " TEMP ", "TRIGGER", " END", "EXPLAIN ", "BEGIN", "''",
+        ];
+        let mut seed = 0x0515_u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for _ in 0..20_000 {
+            let mut text = String::new();
+            let mut c = Completer::default();
+            // pieces end at a line end, as the dump loader gives them
+            for _ in 0..(next() % 6) {
+                for _ in 0..(next() % 6) {
+                    text.push_str(PIECES[(next() % PIECES.len() as u64) as usize]);
+                }
+                text.push('\n');
+                assert_eq!(c.complete(&text), complete_c(&text), "{text:?}");
+            }
+        }
+    }
+
+    /// A trigger of many lines, each ending in `;`, given line by line: every byte is looked at about once
+    #[test]
+    fn completer_reads_the_text_once() {
+        let mut c = Completer::default();
+        let mut text = String::from("CREATE TRIGGER tr AFTER INSERT ON t BEGIN\n");
+        let lines = 100_000;
+        for i in 0..lines {
+            text.push_str(&format!(
+                "  UPDATE t SET a = {i} /* a\n;comment */ WHERE 'x;\n' = '';\n"
+            ));
+            assert!(!c.complete(&text));
+        }
+        text.push_str("END;\n");
+        assert!(c.complete(&text));
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(2),
-            "{:?}",
-            started.elapsed()
+            c.scanned <= text.len() + 2 * lines,
+            "{} bytes looked at for {}",
+            c.scanned,
+            text.len()
         );
+    }
+
+    #[test]
+    fn completer_knows_a_semicolon_inside_a_trailing_line_comment() {
+        let mut c = Completer::default();
+        let text = "CREATE VIEW v AS SELECT 1 -- note;\n";
+        assert!(!c.complete(text));
+        assert_eq!(c.trailing_line_comment(), Some(26));
+        assert!(c.semicolon_would_end());
+        let mut c = Completer::default();
+        assert!(!c.complete("CREATE TRIGGER tr AFTER INSERT ON t BEGIN SELECT 1; -- x;\n"));
+        assert!(c.trailing_line_comment().is_some() && !c.semicolon_would_end());
+        let mut c = Completer::default();
+        assert!(!c.complete("SELECT '-- x;\n"));
+        assert!(c.trailing_line_comment().is_none());
     }
 
     /// Random SQL-ish text, including every prefix: the lexer must never index past the end or split a character

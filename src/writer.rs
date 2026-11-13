@@ -16,6 +16,10 @@
 //! the checkpoint thread was woken, it waits for that run to end. Neither shrinks the WAL file: the next write starts the
 //! WAL over inside blocks that are already allocated, where an fdatasync() needs no file system journal commit. A
 //! WAL growing from empty pays one on every commit, so the file is only truncated on shutdown.
+//!
+//! A RESTART that fails because readers keep using the WAL (reads following each other closely leave one on it at
+//! every moment) is tried again with the database's [`ReadGate`] closed: no new read starts, the reads already
+//! running get up to `--checkpoint-reader-wait-ms` to end, then the WAL restarts (bounds in [`ReadGate`]).
 
 use std::collections::VecDeque;
 use std::path::Path;
@@ -33,6 +37,7 @@ use crate::conn::{Conn, REQUEST_SP};
 use crate::exec::{self, Exec, Results};
 use crate::metrics::DbMetrics;
 use crate::proto::StreamRequest;
+use crate::reader::ReadGate;
 use crate::sql;
 use crate::stream::Streams;
 
@@ -110,10 +115,11 @@ impl Writer {
         cfg: Arc<Config>,
         streams: Arc<Streams>,
         metrics: Arc<DbMetrics>,
+        gate: Arc<ReadGate>,
     ) -> anyhow::Result<Writer> {
         let (tx, rx) = mpsc::channel();
         let max_queue = cfg.max_write_queue as i64;
-        let mut w = Thread::open(path, cfg, rx, streams, metrics.clone())?;
+        let mut w = Thread::open(path, cfg, rx, streams, metrics.clone(), gate)?;
         let thread = std::thread::Builder::new()
             .name("xsqld-writer".into())
             .spawn(move || w.run())?;
@@ -303,6 +309,11 @@ struct Thread {
     last_frames: i64,
     /// A RESTART between groups failed (readers): not tried again before the WAL holds this many frames
     restart_after: i64,
+    /// The last RESTART failed and the WAL has not started over since: the next one closes the read gate
+    starved: bool,
+    /// A RESTART with the gate closed failed too: the next one waits until then, so that reads get the time between
+    gate_retry_at: Option<Instant>,
+    gate: Arc<ReadGate>,
     /// WAL frames when the checkpoint thread was last woken: about where its run stops copying
     kicked_at: i64,
     /// Taken on shutdown
@@ -323,6 +334,7 @@ impl Thread {
         rx: mpsc::Receiver<Msg>,
         streams: Arc<Streams>,
         metrics: Arc<DbMetrics>,
+        gate: Arc<ReadGate>,
     ) -> anyhow::Result<Thread> {
         let mut conn = Conn::open_writer(path, &cfg)?;
         let frames = Arc::new(AtomicI64::new(0));
@@ -339,6 +351,9 @@ impl Thread {
             page_size,
             last_frames: 0,
             restart_after: 0,
+            starved: false,
+            gate_retry_at: None,
+            gate,
             kicked_at: 0,
             checkpointer: Some(checkpointer),
             backlog: VecDeque::new(),
@@ -356,16 +371,15 @@ impl Thread {
             }
             let job = match self.backlog.pop_front() {
                 Some(j) => j,
-                None => match self.rx.recv_timeout(self.cfg.checkpoint_idle()) {
+                None => match self.idle_wait() {
                     Ok(Msg::Job(j)) => j,
                     Ok(Msg::Stop(ack)) => {
                         self.stop = Some(ack);
                         break;
                     }
                     Err(RecvTimeoutError::Timeout) => {
-                        if self.dirty {
-                            self.idle_checkpoint();
-                        }
+                        self.metrics.idle_wakeups.fetch_add(1, Relaxed);
+                        self.idle_checkpoint();
                         continue;
                     }
                     Err(RecvTimeoutError::Disconnected) => break,
@@ -386,6 +400,17 @@ impl Thread {
             self.after_commit();
         }
         self.shutdown();
+    }
+
+    /// Waits for the next message with nothing queued. Wakes up after `--checkpoint-idle-ms` only when there is
+    /// something to checkpoint; with nothing to do (all checkpointed, or `--checkpoint-idle-ms 0`: no idle
+    /// checkpoint) it sleeps until the next message, so an idle database costs no CPU.
+    fn idle_wait(&self) -> Result<Msg, RecvTimeoutError> {
+        if self.dirty && self.cfg.checkpoint_idle_ms > 0 {
+            self.rx.recv_timeout(self.cfg.checkpoint_idle())
+        } else {
+            self.rx.recv().map_err(|_| RecvTimeoutError::Disconnected)
+        }
     }
 
     /// Takes a job off the queue: answers it without running when its client is gone or it waited too long
@@ -497,15 +522,18 @@ impl Thread {
                 let r = ex.run(&job.requests);
                 let (open, closed) = (ex.client_tx_open(), ex.closed);
                 self.conn.set_deadline(None);
+                // the client's transaction stays open past this request, or a deferred foreign key is unresolved
+                // where sqld checks it (at a statement's own commit, see `exec.rs`; a later request of the group must
+                // not resolve it)
+                let run_alone =
+                    matches!(r, Err(exec::Stop::RunAlone)) || (r.is_ok() && (open || self.conn.deferred_fk_pending()));
                 match r {
-                    Err(exec::GroupLost) => {
+                    Err(exec::Stop::GroupLost) => {
                         solo.push(lost(self, job, &mut done, &mut pending));
                         continue 'group;
                     }
-                    Ok(_) if open || self.conn.deferred_fk_pending() => {
-                        // the client's transaction stays open past this request, or it leaves a deferred foreign key
-                        // unresolved (on its own its COMMIT would fail; a later request of the group must not resolve
-                        // it): undo it here, run it alone
+                    _ if run_alone => {
+                        // undo it here, run it alone
                         let undo = format!("ROLLBACK TO {REQUEST_SP}; RELEASE {REQUEST_SP};");
                         if self.conn.c.execute_batch(&undo).is_err() || self.conn.is_autocommit() {
                             solo.push(lost(self, job, &mut done, &mut pending));
@@ -522,6 +550,7 @@ impl Thread {
                         }
                         done.push((job, results, closed));
                     }
+                    Err(exec::Stop::RunAlone) => unreachable!("handled above"),
                 }
             }
             if done.is_empty() {
@@ -590,7 +619,7 @@ impl Thread {
         let mut ex = Exec::native(&self.conn, self.cfg.max_response_bytes);
         let results = match ex.run(&job.requests) {
             Ok(r) => r,
-            Err(exec::GroupLost) => unreachable!("native execution has no group"),
+            Err(_) => unreachable!("native execution has no group"),
         };
         let closed = ex.closed;
         self.conn.set_deadline(None);
@@ -699,6 +728,15 @@ impl Thread {
     /// for its run to end. On a disk whose random writes are slow the checkpoint thread falls behind otherwise, and
     /// the RESTART that has to copy all it left stops writes for hundreds of milliseconds; the waits cap every run,
     /// and so every pause of the write thread, to about `--checkpoint-pages` frames.
+    ///
+    /// Checkpoint starvation: when a RESTART fails, readers still used the WAL. Reads that follow each other closely
+    /// always leave one there, so retrying the same way fails again and again while the WAL grows. The next RESTART
+    /// (after `--checkpoint-pages` more frames) is therefore run with the read gate closed ([`Self::gated_restart`]);
+    /// if even that fails (a read longer than `--checkpoint-reader-wait-ms`), the following one waits at least four
+    /// times that wait. Invariant: as long as the reads running when the gate closes end within that wait, the WAL
+    /// starts over within two RESTART attempts of passing `--checkpoint-restart-bytes`, however closely reads follow
+    /// each other; it only grows on while single reads run longer than the wait (each read is still cut off at its
+    /// own deadline).
     fn after_commit(&mut self) {
         if self.pinned.is_some() {
             return;
@@ -708,13 +746,24 @@ impl Thread {
         let restarted = frames < self.last_frames;
         self.last_frames = frames;
         if restarted {
+            // the WAL started over by itself (a passive checkpoint caught up while no reader was on it): a RESTART
+            // that failed before says nothing about the new WAL
             self.kicked_at = 0;
+            self.restart_after = 0;
+            self.starved = false;
+            self.gate_retry_at = None;
         }
         let Some(c) = &self.checkpointer else { return };
         let (running, mut done) = c.observe(restarted);
         let pages = self.cfg.checkpoint_pages as i64;
+        let restart_due =
+            frames * (self.page_size + 24) >= self.cfg.checkpoint_restart_bytes as i64 && frames >= self.restart_after;
+        // while starved, only a RESTART with the gate closed has a chance; it waits its turn
+        let gated = restart_due && self.starved && self.gate_retry_at.is_none_or(|at| Instant::now() >= at);
+        let restart = restart_due && (!self.starved || gated);
         if running {
-            if frames - self.kicked_at <= pages {
+            // a RESTART cannot start beside a running checkpoint (it would fail at once); the gated one waits for it
+            if frames - self.kicked_at <= pages && !gated {
                 return;
             }
             let started = Instant::now();
@@ -724,20 +773,21 @@ impl Thread {
         if frames < pages {
             return;
         }
-        let restart =
-            frames * (self.page_size + 24) >= self.cfg.checkpoint_restart_bytes as i64 && frames >= self.restart_after;
         if !restart && frames - done > pages {
             c.request();
             self.kicked_at = frames;
             return;
         }
-        let mode = if restart {
-            CheckpointMode::RESTART
+        let r = if gated {
+            self.gated_restart()
+        } else if restart {
+            checkpoint(&self.conn, CheckpointMode::RESTART, &self.metrics)
         } else {
-            CheckpointMode::PASSIVE
+            checkpoint(&self.conn, CheckpointMode::PASSIVE, &self.metrics)
         };
-        let r = checkpoint(&self.conn, mode, &self.metrics);
-        if let Some((_, done)) = r {
+        if let Some((_, done)) = r
+            && let Some(c) = &self.checkpointer
+        {
             c.record(done);
         }
         if restart {
@@ -745,8 +795,31 @@ impl Thread {
                 self.emptied();
             } else {
                 self.restart_after = frames + pages;
+                if gated {
+                    self.gate_retry_at = Some(Instant::now() + 4 * self.cfg.checkpoint_reader_wait());
+                }
+                self.starved = true;
             }
         }
+    }
+
+    /// RESTART with no new read transaction starting meanwhile: closes the read gate, waits up to
+    /// `--checkpoint-reader-wait-ms` for the read requests already running to end, runs RESTART (which then only
+    /// waits its usual short while, for readers that did not come through the gate, such as a dump's snapshot) and
+    /// opens the gate again. Writes wait meanwhile; this only runs after a RESTART failed.
+    fn gated_restart(&mut self) -> Option<(i64, i64)> {
+        let started = Instant::now();
+        let closed = self.gate.close();
+        if !closed.drain(self.cfg.checkpoint_reader_wait()) {
+            tracing::warn!(
+                wait_ms = self.cfg.checkpoint_reader_wait_ms,
+                "reads still running after the checkpoint reader wait"
+            );
+        }
+        let r = checkpoint(&self.conn, CheckpointMode::RESTART, &self.metrics);
+        drop(closed);
+        self.metrics.checkpoint_gate.record(started.elapsed());
+        r
     }
 
     /// Nothing to do for a while: copy the whole WAL into the database file, so that the next write starts the WAL
@@ -776,6 +849,8 @@ impl Thread {
         self.metrics.wal_frames.store(0, Relaxed);
         self.dirty = false;
         self.restart_after = 0;
+        self.starved = false;
+        self.gate_retry_at = None;
     }
 
     fn shutdown(&mut self) {
@@ -835,6 +910,7 @@ mod tests {
         _dir: tempfile::TempDir,
         path: PathBuf,
         writer: Writer,
+        readers: Arc<crate::reader::Readers>,
         streams: Arc<Streams>,
         metrics: Arc<DbMetrics>,
     }
@@ -843,6 +919,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = Config::for_tests(dir.path());
         tweak(&mut cfg);
+        let cfg = Arc::new(cfg);
         let path = dir.path().join("data");
         rusqlite::Connection::open(&path)
             .unwrap()
@@ -850,11 +927,14 @@ mod tests {
             .unwrap();
         let streams = Streams::new(cfg.stream_idle());
         let metrics = Arc::new(DbMetrics::default());
-        let writer = Writer::start(&path, Arc::new(cfg), streams.clone(), metrics.clone()).unwrap();
+        let gate = ReadGate::new(metrics.clone());
+        let writer = Writer::start(&path, cfg.clone(), streams.clone(), metrics.clone(), gate.clone()).unwrap();
+        let readers = Arc::new(crate::reader::Readers::new(path.clone(), cfg, gate));
         Fixture {
             _dir: dir,
             path,
             writer,
+            readers,
             streams,
             metrics,
         }
@@ -1376,6 +1456,159 @@ mod tests {
         assert_eq!(rows(&f, "SELECT count(*) FROM c"), 0);
     }
 
+    /// Review of 0.1.0: deferred foreign keys were checked at the end of a request, not where sqld checks them, at
+    /// the commit of each statement outside a transaction and at the client's COMMIT (checked against sqld 0.24.32)
+    #[test]
+    fn deferred_foreign_keys_are_checked_per_statement_like_sqld() {
+        let f = fixture(|c| c.group_linger_us = 50_000);
+        assert!(is_ok(
+            &f.send(
+                1,
+                false,
+                &execs(&[
+                    "CREATE TABLE p(id INTEGER PRIMARY KEY)",
+                    "CREATE TABLE c(id INTEGER PRIMARY KEY, p INTEGER REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED)",
+                ]),
+            ),
+            1
+        ));
+        // in a group with another request, so that the request runs grouped first
+        let (other, other_rx) = f.job(9, false, &execs(&["INSERT INTO t(b) VALUES ('other')"]));
+        let (job, rx) = f.job(
+            1,
+            false,
+            &execs(&["INSERT INTO c VALUES (1, 5)", "INSERT INTO p VALUES (5)"]),
+        );
+        f.writer.submit(other);
+        f.writer.submit(job);
+        let o = rx.blocking_recv().unwrap();
+        assert!(is_ok(&other_rx.blocking_recv().unwrap(), 0));
+        assert_eq!(
+            json(&o)[0]["error"]["message"],
+            "SQLite error: FOREIGN KEY constraint failed",
+            "{o:?}"
+        );
+        assert!(is_ok(&o, 1));
+        assert_eq!(
+            (rows(&f, "SELECT count(*) FROM c"), rows(&f, "SELECT count(*) FROM p")),
+            (0, 1)
+        );
+        // the client's COMMIT fails and its transaction stays open, whatever follows in the request
+        let o = f.send(
+            2,
+            false,
+            &execs(&[
+                "BEGIN",
+                "INSERT INTO c VALUES (2, 6)",
+                "COMMIT",
+                "INSERT INTO p VALUES (6)",
+                "COMMIT",
+            ]),
+        );
+        let v = json(&o);
+        assert_eq!(v[2]["error"]["code"], "SQLITE_CONSTRAINT", "{v}");
+        assert!(is_ok(&o, 3) && is_ok(&o, 4), "{v}");
+        assert!(matches!(o, Outcome::Done { pinned: false, .. }));
+        assert_eq!(
+            (rows(&f, "SELECT count(*) FROM c"), rows(&f, "SELECT count(*) FROM p")),
+            (1, 2)
+        );
+        // resolved inside the client's transaction: one group, as before
+        let groups = f.metrics.groups.load(Relaxed);
+        let o = f.send(
+            3,
+            false,
+            &execs(&[
+                "BEGIN",
+                "INSERT INTO c VALUES (3, 7)",
+                "INSERT INTO p VALUES (7)",
+                "COMMIT",
+            ]),
+        );
+        assert!((0..4).all(|i| is_ok(&o, i)), "{o:?}");
+        assert_eq!(f.metrics.groups.load(Relaxed), groups + 1, "ran in a group");
+    }
+
+    /// Review of 0.1.0: `ROLLBACK TRANSACTION <name> TO <savepoint>` was taken for a whole rollback (checked against
+    /// sqld 0.24.32: `no such savepoint`, and the transaction goes on)
+    #[test]
+    fn a_named_rollback_to_a_savepoint_is_not_a_rollback() {
+        let f = fixture(|_| {});
+        let o = f.send(
+            1,
+            false,
+            &execs(&[
+                "BEGIN",
+                "INSERT INTO t(b) VALUES ('kept')",
+                "ROLLBACK TRANSACTION t TO nope",
+                "COMMIT",
+            ]),
+        );
+        assert_eq!(
+            json(&o)[2]["error"]["message"],
+            "SQLite error: no such savepoint: nope",
+            "{o:?}"
+        );
+        assert!(is_ok(&o, 3));
+        let o = f.send(
+            1,
+            false,
+            &execs(&[
+                "BEGIN",
+                "INSERT INTO t(b) VALUES ('also kept')",
+                "SAVEPOINT s",
+                "INSERT INTO t(b) VALUES ('undone')",
+                "ROLLBACK TRANSACTION t TO s",
+                "COMMIT",
+            ]),
+        );
+        assert!((0..6).all(|i| is_ok(&o, i)), "{o:?}");
+        assert_eq!(rows(&f, "SELECT count(*) FROM t WHERE b <> 'undone'"), 2);
+        assert_eq!(f.count(), 2);
+    }
+
+    /// Review of 0.1.0: a write whose RETURNING rows exceed `--max-response-bytes` was reported as failed although
+    /// it was committed (sqld does the same), so a client retrying it wrote twice. Now it is undone.
+    #[test]
+    fn a_write_whose_returned_rows_are_too_large_is_undone() {
+        let f = fixture(|c| c.max_response_bytes = 5000);
+        let big = "INSERT INTO t(b) SELECT 'row ' || i || hex(zeroblob(1000)) FROM \
+                   (WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 20) SELECT i FROM n) \
+                   RETURNING b";
+        let too_large = |o: &Outcome, i: usize| json(o)[i]["error"]["code"] == "RESPONSE_TOO_LARGE";
+        // grouped
+        let o = f.send(
+            1,
+            false,
+            &execs(&[big, "INSERT INTO t(b) VALUES ('after') RETURNING a"]),
+        );
+        assert!(too_large(&o, 0) && is_ok(&o, 1), "{o:?}");
+        assert_eq!(f.count(), 1);
+        // on its own, outside a transaction (a PRAGMA makes the request run on its own)
+        let o = f.send(1, false, &execs(&["PRAGMA user_version", big]));
+        assert!(too_large(&o, 1), "{o:?}");
+        assert_eq!(f.count(), 1);
+        // inside a client transaction held across requests: only the statement is undone
+        let o = f.send(2, false, &execs(&["BEGIN", "INSERT INTO t(b) VALUES ('in tx')"]));
+        assert!(matches!(o, Outcome::Done { pinned: true, .. }));
+        let o = f.send(2, true, &execs(&[big, "COMMIT"]));
+        assert!(too_large(&o, 0) && is_ok(&o, 1), "{o:?}");
+        assert_eq!(f.count(), 2);
+        // within the limit, nothing changes
+        let o = f.send(
+            3,
+            false,
+            &execs(&["INSERT INTO t(b) VALUES ('small') RETURNING b", "PRAGMA user_version"]),
+        );
+        assert!(is_ok(&o, 0), "{o:?}");
+        assert_eq!(json(&o)[0]["response"]["result"]["rows"][0][0]["value"], "small");
+        assert_eq!(f.count(), 3);
+        assert!(is_ok(
+            &f.send(3, false, &execs(&["INSERT INTO t(b) VALUES ('later')"])),
+            0
+        ));
+    }
+
     #[test]
     fn defer_foreign_keys_set_outside_a_transaction_does_not_reach_other_streams() {
         let f = fixture(|_| {});
@@ -1526,14 +1759,7 @@ mod tests {
         let mut cfg = Config::for_tests(dir.path());
         cfg.checkpoint_pages = 10;
         let (_tx, rx) = mpsc::channel();
-        let mut t = Thread::open(
-            &dir.path().join("data"),
-            Arc::new(cfg),
-            rx,
-            Streams::new(Duration::from_secs(60)),
-            Arc::new(DbMetrics::default()),
-        )
-        .unwrap();
+        let mut t = thread(cfg, rx);
         let state = t.checkpointer.as_ref().unwrap().state.clone();
         state.0.lock().unwrap().running = true;
         t.kicked_at = 100;
@@ -1582,6 +1808,170 @@ mod tests {
         assert_eq!(
             t.kicked_at, 111,
             "the checkpoint thread is woken again for the frames written meanwhile"
+        );
+    }
+
+    /// A write thread outside a running server, for looking at its checkpoint decisions
+    fn thread(cfg: Config, rx: mpsc::Receiver<Msg>) -> Thread {
+        let metrics = Arc::new(DbMetrics::default());
+        Thread::open(
+            &cfg.db_path.join("data"),
+            Arc::new(cfg.clone()),
+            rx,
+            Streams::new(Duration::from_secs(60)),
+            metrics.clone(),
+            ReadGate::new(metrics),
+        )
+        .unwrap()
+    }
+
+    /// Review of 0.1.0: after a failed RESTART the next one waited for `--checkpoint-pages` more frames even when the
+    /// WAL had started over by itself in the meantime
+    #[test]
+    fn a_wal_that_started_over_forgets_the_failed_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::for_tests(dir.path());
+        cfg.checkpoint_pages = 10;
+        cfg.checkpoint_restart_bytes = 20 * 4120;
+        let (_tx, rx) = mpsc::channel();
+        let mut t = thread(cfg, rx);
+        // a RESTART at 500 frames failed: not before 510
+        t.last_frames = 500;
+        t.restart_after = 510;
+        t.starved = true;
+        t.gate_retry_at = Some(Instant::now() + Duration::from_secs(3600));
+        // the WAL started over and has grown past the RESTART size again
+        t.frames.store(30, Relaxed);
+        t.after_commit();
+        assert_eq!(t.restart_after, 0, "the old WAL's failure was kept");
+        assert!(!t.starved && t.gate_retry_at.is_none());
+        assert_eq!(
+            t.metrics.checkpoint_restart.count.load(Relaxed),
+            1,
+            "RESTART is due at once on the new WAL"
+        );
+    }
+
+    /// Review of 0.1.0: `--checkpoint-idle-ms 0` made the write thread spin (a receive with a zero timeout in a loop)
+    #[test]
+    fn an_idle_write_thread_sleeps() {
+        for idle_ms in [0, 20] {
+            let f = fixture(|c| c.checkpoint_idle_ms = idle_ms);
+            assert!(is_ok(&f.send(1, false, &execs(&["INSERT INTO t(b) VALUES ('x')"])), 0));
+            std::thread::sleep(Duration::from_millis(300));
+            let wakeups = f.metrics.idle_wakeups.load(Relaxed);
+            let expected = if idle_ms == 0 { 0 } else { 1 };
+            assert!(
+                wakeups <= expected,
+                "--checkpoint-idle-ms {idle_ms}: {wakeups} wakeups in 300 ms"
+            );
+            if idle_ms > 0 {
+                assert_eq!(
+                    f.metrics.checkpoint_passive.count.load(Relaxed),
+                    1,
+                    "one idle checkpoint"
+                );
+            }
+            assert!(is_ok(&f.send(1, false, &execs(&["INSERT INTO t(b) VALUES ('y')"])), 0));
+            assert_eq!(f.count(), 2);
+        }
+    }
+
+    /// Review of 0.1.0 (checkpoint starvation): read requests of a few milliseconds following each other closely
+    /// leave a reader on the WAL at every moment, so RESTART never found a gap and the WAL grew for as long as the
+    /// writes went on (619 MB in 8 s in the review). With the read gate the WAL keeps starting over, and every read
+    /// still succeeds.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn reads_following_each_other_closely_do_not_starve_the_restart() {
+        const RESTART: u64 = 256 * 1024;
+        let f = Arc::new(fixture(|c| {
+            c.checkpoint_pages = 32;
+            c.checkpoint_restart_bytes = RESTART;
+            c.checkpoint_reader_wait_ms = 2_000;
+        }));
+        let row = "x".repeat(3000);
+        let (job, rx) = f.job(
+            1,
+            false,
+            &execs(&["CREATE TABLE big(v TEXT)", "INSERT INTO big VALUES ('seed')"]),
+        );
+        f.writer.submit(job);
+        assert!(is_ok(&rx.await.unwrap(), 1));
+        let until = Instant::now() + Duration::from_millis(1500);
+        // three clients, each reading back to back: always one of them inside a read
+        let readers: Vec<_> = (0..3)
+            .map(|_| {
+                let f = f.clone();
+                tokio::spawn(async move {
+                    let mut reads = 0;
+                    while Instant::now() < until {
+                        let q = serde_json::from_str::<crate::proto::PipelineReq>(&format!(
+                            r#"{{"requests":{}}}"#,
+                            execs(&[
+                                "SELECT (SELECT max(rowid) FROM big), count(*) FROM (WITH RECURSIVE n(i) AS \
+                                 (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 200000) SELECT i FROM n)"
+                            ])
+                        ))
+                        .unwrap()
+                        .requests;
+                        let out = f
+                            .readers
+                            .run(q, Instant::now() + Duration::from_secs(10))
+                            .await
+                            .unwrap();
+                        let crate::reader::ReadOutcome::Done { results, .. } = out else {
+                            panic!("a read did not run")
+                        };
+                        assert!(matches!(results[0], StreamResult::Ok { .. }), "{results:?}");
+                        reads += 1;
+                    }
+                    reads
+                })
+            })
+            .collect();
+        let writers: Vec<_> = (0..2)
+            .map(|w| {
+                let (f, row) = (f.clone(), row.clone());
+                tokio::spawn(async move {
+                    let mut i = 0;
+                    while Instant::now() < until {
+                        let (job, rx) = f.job(
+                            10 + w,
+                            false,
+                            &execs(&[&format!("INSERT INTO big VALUES ('{w}{i}{row}')")]),
+                        );
+                        f.writer.submit(job);
+                        assert!(is_ok(&rx.await.unwrap(), 0));
+                        i += 1;
+                    }
+                    i
+                })
+            })
+            .collect();
+        let mut reads = 0;
+        for r in readers {
+            reads += r.await.unwrap();
+        }
+        let mut writes = 0;
+        for w in writers {
+            writes += w.await.unwrap();
+        }
+        // the WAL file is never truncated while running: its size is the most the WAL ever held
+        let wal = std::fs::metadata(wal_path(&f.path)).unwrap().len();
+        let written = writes as u64 * 3000;
+        assert!(
+            reads > 20 && written > 4 * RESTART,
+            "{reads} reads, {writes} writes: too little load"
+        );
+        assert!(
+            wal < 3 * RESTART,
+            "WAL reached {wal} bytes ({writes} writes of 3 KB, {reads} reads); restarts: {}, gated: {}",
+            f.metrics.checkpoint_restart.count.load(Relaxed),
+            f.metrics.checkpoint_gate.count.load(Relaxed)
+        );
+        assert!(
+            f.metrics.checkpoint_gate.count.load(Relaxed) > 0,
+            "the gate was never needed"
         );
     }
 }

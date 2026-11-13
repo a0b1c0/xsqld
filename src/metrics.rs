@@ -48,6 +48,13 @@ pub struct DbMetrics {
     pub checkpoint_wait: Timer,
     /// Checkpoints that could not finish because a reader still used old frames
     pub checkpoint_busy: AtomicU64,
+    /// RESTART checkpoints run with new read transactions held back (a RESTART failed before: checkpoint
+    /// starvation), timed from closing the gate to opening it
+    pub checkpoint_gate: Timer,
+    /// Read requests held back by such a checkpoint, and for how long
+    pub read_gate_wait: Timer,
+    /// Times the write thread woke up because it had been idle for `--checkpoint-idle-ms`
+    pub idle_wakeups: AtomicU64,
     pub wal_frames: AtomicI64,
     /// 1 while a transaction left open across HTTP requests holds the writer
     pub pinned: AtomicI64,
@@ -84,6 +91,8 @@ impl DbMetrics {
             ("checkpoint_passive", &self.checkpoint_passive),
             ("checkpoint_restart", &self.checkpoint_restart),
             ("checkpoint_wait", &self.checkpoint_wait),
+            ("checkpoint_gate", &self.checkpoint_gate),
+            ("read_gate_wait", &self.read_gate_wait),
         ] {
             put(out, &format!("{name}_count"), ns, u(&t.count));
             put(out, &format!("{name}_seconds_sum"), ns, Secs(u(&t.sum_us)));

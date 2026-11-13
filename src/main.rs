@@ -50,6 +50,10 @@ async fn main() -> anyhow::Result<()> {
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
         _ => {}
     }
+    // files of a build from a dump that did not finish, WAL files of databases deleted halfway
+    for file in db::clean_leftovers(&cfg)? {
+        tracing::warn!(file = %file.display(), "removed a file left by a crash");
+    }
     let cfg = Arc::new(cfg);
     let registry = db::Registry::new(cfg.clone());
 

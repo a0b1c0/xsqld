@@ -4,8 +4,12 @@ and bodies must match field by field.
 
 Not compared (known, documented in README §4): query_duration_ms; replication_index (sqld: WAL frame number, xsqld:
 null); rows_read / rows_written (sqld: libsql's own counters; the runtime only copies them into D1's meta); baton
-values (random on both sides; only null vs. non-null is compared); the message text of SQL_PARSE_ERROR (sqld uses its
-own parser).
+values (random on both sides; only null vs. non-null is compared); the message text of syntax errors (sqld uses its
+own parser; SQL_PARSE_ERROR for unsupported statements is compared word for word).
+
+Also compared: requests sent at the same time (xsqld runs them in one group transaction, sqld one by one), each
+touching rows of its own so that every order gives the same results; GET /dump with and without preserve_row_ids;
+databases created from dumps (a load that fails on xsqld counts as a difference).
 
 Usage:
   docker run -d --name e415-sqld -p 127.0.0.1:18080:8080 -p 127.0.0.1:18081:8081 --entrypoint /bin/sqld \
@@ -60,8 +64,8 @@ def normalize(status, data):
                     out[k] = None if val is None else "<baton>"
                     continue
                 out[k] = walk(val)
-            if out.get("code") == "SQL_PARSE_ERROR":
-                out["message"] = "<parse error>"
+            if out.get("code") == "SQL_PARSE_ERROR" and "unsupported statement" not in str(out.get("message")):
+                out["message"] = "<syntax error>"
             return out
         if isinstance(x, list):
             return [walk(i) for i in x]
@@ -108,6 +112,9 @@ def blob(b64):
 
 NULL = {"type": "null"}
 CLOSE = {"type": "close"}
+# a result past both servers' response limits (sqld 0.24.32's, and xsqld's --max-response-bytes default of 64 MB)
+BIG_RESULT = ("SELECT hex(zeroblob(1000000)) FROM (WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n "
+              "WHERE i < 40) SELECT i FROM n)")
 
 
 def d1_batch(*stmts, begin="BEGIN IMMEDIATE"):
@@ -197,6 +204,59 @@ CASES = {
         [ex("SELECT zeroblob(6000000)")],
         [ex("SELECT ?", t("x" * 200000))],
     ],
+    "pragmas": [
+        [ex("PRAGMA foreign_keys"), ex("PRAGMA recursive_triggers"), ex("PRAGMA defer_foreign_keys"), ex("PRAGMA trusted_schema")],
+        [ex("PRAGMA journal_mode"), ex("PRAGMA page_size"), ex("PRAGMA encoding"), ex("PRAGMA user_version")],
+        [ex("PRAGMA table_info(c)"), ex("PRAGMA index_list(c)"), ex("PRAGMA foreign_key_list(c)"), ex("PRAGMA integrity_check")],
+        [ex("SELECT name, pk FROM pragma_table_info('c') ORDER BY cid"), ex("PRAGMA threads"), ex("PRAGMA analysis_limit")],
+        [ex("PRAGMA user_version = 7"), ex("PRAGMA user_version"), ex("PRAGMA defer_foreign_keys = ON"), ex("PRAGMA defer_foreign_keys")],
+        [ex("PRAGMA query_only = 1")],
+        [ex("PRAGMA writable_schema = ON")],
+        [ex("PRAGMA recursive_triggers = ON")],
+        [ex("PRAGMA optimize")],
+        [ex("ANALYZE")],
+        [ex("VACUUM")],
+    ],
+    "temporary objects": [
+        [ex("CREATE TEMP TABLE tt(a)")],
+        [ex("CREATE TEMPORARY VIEW tv AS SELECT 1")],
+        [ex("CREATE TEMP TRIGGER ttr AFTER INSERT ON p BEGIN SELECT 1; END")],
+        [ex("CREATE TABLE temp.tx(a)")],
+        [ex("SELECT count(*) FROM sqlite_temp_master")],
+    ],
+    "savepoints": [
+        [ex("SAVEPOINT a"), ex("INSERT INTO p(id, name) VALUES (30, 'sp')"), ex("SAVEPOINT b"), ex("INSERT INTO p(id, name) VALUES (31, 'sp')"),
+         ex("ROLLBACK TO b"), ex("RELEASE a"), ex("SELECT group_concat(id) FROM p WHERE id >= 30")],
+        [ex("BEGIN"), ex("SAVEPOINT s"), ex("INSERT INTO p(id, name) VALUES (32, 'sp')"), ex("ROLLBACK TRANSACTION t TO s"),
+         ex("ROLLBACK TRANSACTION t TO nope"), ex("COMMIT"), ex("SELECT count(*) FROM p WHERE id = 32")],
+        [ex("RELEASE nope"), ex("ROLLBACK TO nope")],
+        ([ex("BEGIN"), ex("SAVEPOINT x"), ex("INSERT INTO p(id, name) VALUES (33, 'sp')")], None),
+        ([ex("ROLLBACK TO x"), ex("INSERT INTO p(id, name) VALUES (34, 'sp')"), ex("COMMIT")], "keep"),
+        [ex("SELECT group_concat(id) FROM p WHERE id IN (33, 34)")],
+    ],
+    "deferred foreign keys": [
+        [ex("CREATE TABLE dp(id INTEGER PRIMARY KEY)"), ex("CREATE TABLE dc(id INTEGER PRIMARY KEY, p INTEGER REFERENCES dp(id) DEFERRABLE INITIALLY DEFERRED)")],
+        [ex("INSERT INTO dc VALUES (1, 5)"), ex("INSERT INTO dp VALUES (5)")],
+        [ex("BEGIN"), ex("INSERT INTO dc VALUES (2, 6)"), ex("COMMIT"), ex("INSERT INTO dp VALUES (6)"), ex("COMMIT")],
+        [ex("BEGIN"), ex("INSERT INTO dc VALUES (3, 7)"), ex("INSERT INTO dp VALUES (7)"), ex("COMMIT")],
+        [d1_batch(ex("INSERT INTO dc VALUES (4, 8)"))],
+        [ex("INSERT INTO dc VALUES (5, 9) RETURNING id")],
+        [ex("SELECT (SELECT group_concat(id) FROM dc), (SELECT group_concat(id) FROM dp)")],
+    ],
+    "smaller protocol details": [
+        [ex(";BEGIN"), ex("INSERT INTO p(id, name) VALUES (40, 'x')"), ex("ROLLBACK"), ex("SELECT count(*) FROM p WHERE id = 40")],
+        [{"type": "execute", "stmt": {"sql": "SELECT :a, :a", "named_args": [{"name": "a", "value": i(1)}, {"name": "a", "value": i(2)}]}}],
+        [{"type": "execute", "stmt": {"sql": "SELECT :a", "named_args": [{"name": ":a", "value": i(1)}, {"name": "a", "value": i(2)}]}}],
+        [ex("SELECT hex(?)", blob("AAE==")), ex("SELECT hex(?)", blob("="))],
+        [ex("WITH replace AS (SELECT 1 AS x) SELECT x FROM replace")],
+        [CLOSE, CLOSE],
+    ],
+    "response too large": [
+        [ex("SELECT 1"), ex(BIG_RESULT), ex("SELECT 3")],
+        [{"type": "batch", "batch": {"steps": [{"stmt": {"sql": "INSERT INTO p(id, name) VALUES (50, 'before')"}}, {"stmt": {"sql": BIG_RESULT}},
+                                               {"stmt": {"sql": "INSERT INTO p(id, name) VALUES (51, 'after')"}}]}}, ex("SELECT 4")],
+        [ex("SELECT group_concat(id) FROM p WHERE id IN (50, 51)")],
+    ],
     "transaction across requests (baton)": [
         ([ex("BEGIN"), ex("INSERT INTO p(id, name) VALUES (20, 'twenty')")], None),
         ([ex("SELECT name FROM p WHERE id = 20")], "keep"),
@@ -208,6 +268,63 @@ CASES = {
         ([ex("SELECT count(*) FROM p WHERE id = 22")], None),
     ],
 }
+
+
+def concurrent_cases(a, b, n=48):
+    """Requests sent at the same time, each on its own rows: xsqld runs them in one group transaction (each in a
+    savepoint), sqld one after the other; any order gives the same results. sqld's answers for contention (busy, or
+    429 when it could not open a connection in time) are retried. Run last: sqld 0.24.32 can be left unable to write
+    after such load."""
+    import concurrent.futures
+
+    setup = [ex("CREATE TABLE g(id INTEGER PRIMARY KEY, k TEXT UNIQUE, n INTEGER CHECK (n >= 0))"),
+             ex("CREATE TABLE gp(id INTEGER PRIMARY KEY)"),
+             ex("CREATE TABLE gc(id INTEGER PRIMARY KEY, p INTEGER REFERENCES gp(id) DEFERRABLE INITIALLY DEFERRED)"),
+             ex("INSERT INTO g VALUES (0, 'taken', 0)")]
+
+    def req_for(k):
+        kind = k % 6
+        if kind == 0:
+            return [ex("INSERT INTO g VALUES (?, ?, 1)", i(k + 1), t(f"k{k}")), ex("SELECT n FROM g WHERE id = ?", i(k + 1))]
+        if kind == 1:
+            return [ex("INSERT INTO g VALUES (?, 'taken', 1)", i(k + 1))]
+        if kind == 2:
+            return [d1_batch(ex("INSERT INTO g VALUES (?, ?, 1)", i(k + 1), t(f"k{k}")), ex("INSERT INTO g VALUES (?, ?, -1)", i(k + 1000), t(f"m{k}")))]
+        if kind == 3:
+            return [ex("BEGIN"), ex("INSERT INTO g VALUES (?, ?, 2)", i(k + 1), t(f"k{k}")), ex("ROLLBACK"), ex("SELECT count(*) FROM g WHERE id = ?", i(k + 1))]
+        if kind == 4:
+            return [ex("INSERT INTO gc VALUES (?, ?)", i(k), i(k)), ex("INSERT INTO gp VALUES (?)", i(k))]
+        return [ex("INSERT INTO g VALUES (?, ?, 3) RETURNING id, k, n", i(k + 1), t(f"k{k}")), ex("SELECT changes()")]
+
+    def send(side, requests):
+        for _ in range(100):
+            status, data = side.pipeline(requests, None)
+            if b"SQLITE_BUSY" not in data and status != 429:
+                break
+            time.sleep(0.05)
+        return normalize(status, data)
+
+    out = {}
+    for s in (a, b):
+        s.ns_saved = s.ns
+        s.ns = s.ns + "-group"
+        st, body = request(s.admin, "POST", f"/v1/namespaces/{s.ns}/create", {})
+        assert st == 200, body
+        s.pipeline(setup, None)
+    results = []
+    for s in (a, b):
+        with concurrent.futures.ThreadPoolExecutor(max_workers=16) as pool:
+            results.append(list(pool.map(lambda k: send(s, req_for(k)), range(n))))
+    for k in range(n):
+        if results[0][k] != results[1][k]:
+            out[f"concurrent request {k}"] = (results[0][k], results[1][k])
+    rows = [ex("SELECT * FROM g ORDER BY id"), ex("SELECT * FROM gc ORDER BY id"), ex("SELECT * FROM gp ORDER BY id")]
+    final = [send(s, rows) for s in (a, b)]
+    if final[0] != final[1]:
+        out["concurrent: final rows"] = tuple(final)
+    for s in (a, b):
+        s.ns = s.ns_saved
+    return out
 
 
 def run_case(a, b, steps):
@@ -287,6 +404,8 @@ def dump_cases(a, b, sqld_dump_host):
         assert status == 200 and all(r["type"] == "ok" for r in json.loads(body)["results"]), body[:300]
         dumps.append(request(s.addr, "GET", "/dump", host=f"{ns}.db")[1])
     result["dump bytes identical"] = dumps[0] == dumps[1]
+    with_rowids = [request(s.addr, "GET", "/dump?preserve_row_ids=true", host=f"{s.ns}-dump.db")[1] for s in (a, b)]
+    result["dump with preserve_row_ids bytes identical"] = with_rowids[0] == with_rowids[1]
     # a dump without the multi-line trigger (sqld's loader splits statements at every line ending in ';')
     simple = os.path.join(HERE, "fixtures", "_simple-dump.sql")
     with open(simple, "wb") as fh:
@@ -306,6 +425,8 @@ def dump_cases(a, b, sqld_dump_host):
     for tag, ((sa, ma, da), (sb, mb, db)) in restored:
         result[f"load {tag}: sqld"] = f"HTTP {sa} {ma}".strip()
         result[f"load {tag}: xsqld"] = f"HTTP {sb} {mb}".strip()
+        # sqld fails on the multi-line trigger (README §4); xsqld must load both
+        result[f"load {tag}: xsqld loaded it"] = sb == 200
         if sb == 200:
             src_dump = open(simple, "rb").read() if tag == "simple" else dumps[1]
             result[f"load {tag}: xsqld dump of the loaded database equals the source"] = db == src_dump
@@ -351,6 +472,12 @@ def main():
         print(f"dump  {k}: {v}")
         if v is False:
             failed += 1
+    grouped = concurrent_cases(a, b)
+    for k, (va, vb) in grouped.items():
+        failed += 1
+        print(f"DIFF  {k}\n     sqld : {json.dumps(va, ensure_ascii=False)[:1500]}\n     xsqld: {json.dumps(vb, ensure_ascii=False)[:1500]}")
+    if not grouped:
+        print("same  48 requests sent at the same time, and the rows they left")
     print(f"\n{total} pipeline requests compared; {'all identical' if failed == 0 else f'{failed} groups differ'}")
     sys.exit(1 if failed else 0)
 

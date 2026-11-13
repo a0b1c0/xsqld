@@ -17,6 +17,8 @@ static EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
 pub const CLIENT_SP: &str = "xsqld_client";
 /// Name of the savepoint around one request inside the group transaction
 pub const REQUEST_SP: &str = "xsqld_request";
+/// Name of the savepoint around one write that returns rows (undone when its rows exceed the response limit)
+pub const STMT_SP: &str = "xsqld_statement";
 
 /// Client SQL longer than this is compiled for one use and not kept in the statement cache. Statements worth caching
 /// are parameterized and short; long ones carry their values inline and never repeat, and a cache full of them (256
@@ -217,6 +219,7 @@ const PRAGMA_INTROSPECTION: &[&str] = &[
 
 /// Settings that may be read (`PRAGMA name`) but not assigned
 const PRAGMA_READABLE: &[&str] = &[
+    "analysis_limit",
     "application_id",
     "auto_vacuum",
     "automatic_index",
@@ -232,6 +235,7 @@ const PRAGMA_READABLE: &[&str] = &[
     "foreign_keys",
     "freelist_count",
     "function_list",
+    "hard_heap_limit",
     "journal_mode",
     "journal_size_limit",
     "legacy_alter_table",
@@ -247,8 +251,11 @@ const PRAGMA_READABLE: &[&str] = &[
     "reverse_unordered_selects",
     "schema_version",
     "secure_delete",
+    "soft_heap_limit",
+    "stats",
     "synchronous",
     "temp_store",
+    "threads",
     "trusted_schema",
     "user_version",
     "wal_autocheckpoint",
@@ -393,8 +400,15 @@ mod tests {
     /// Review of 0.1.0, finding 3: a long LIKE or GLOB pattern is refused before SQLite's matcher sees it
     #[test]
     fn long_like_patterns_are_refused() {
+        long_like_patterns_are_refused_at(Config::for_tests(std::path::Path::new("/")).max_like_pattern_bytes);
+        // the largest value `Config::validate` accepts still fits on the stack
+        long_like_patterns_are_refused_at(crate::config::MAX_LIKE_PATTERN_BYTES);
+    }
+
+    fn long_like_patterns_are_refused_at(limit: i32) {
         let dir = tempfile::tempdir().unwrap();
-        let cfg = Config::for_tests(dir.path());
+        let mut cfg = Config::for_tests(dir.path());
+        cfg.max_like_pattern_bytes = limit;
         let w = Conn::open_writer(&dir.path().join("data"), &cfg).unwrap();
         let r = Conn::open_reader(&dir.path().join("data"), &cfg).unwrap();
         let limit = cfg.max_like_pattern_bytes as usize;

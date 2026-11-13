@@ -9,6 +9,71 @@ All notable changes to xsqld are documented in this file. The format is based on
 exposes them as `xsqld_build_info{version="…",commit="…"} 1`. Builds outside a git checkout can set
 `XSQLD_GIT_COMMIT`; without it and without git the commit reads `unknown`.
 
+## [0.1.2] - 2026-11-12
+
+Fixes for the issues of the 0.1.0 code review that 0.1.1 left open (README §4.1 lists the few that remain). sqld's
+command line and every 0.1.1 default keep working; the new flags have defaults that need no change.
+
+### Added
+
+- `--checkpoint-reader-wait-ms` (200), `--response-write-timeout-ms` (60000), `--dump-load-max-statement-bytes`
+  (128 MiB) and `--dump-load-timeout-ms` (1800000); README §2.1 lists every flag with its default and range.
+- Metrics `checkpoint_gate_*` (RESTARTs run with new reads held back) and `read_gate_wait_*` (reads held back).
+
+### Fixed
+
+- Checkpoint starvation: read requests following each other closely while writes went on always left a reader on
+  the WAL, so RESTART never found a gap and the WAL grew without bound (619 MB in 8 s in the review). After a failed
+  RESTART the next one holds back new reads, waits up to `--checkpoint-reader-wait-ms` for the running ones and
+  restarts the WAL; reads are held back at most that long, never past their deadline, and nothing they do changes.
+- After a failed RESTART the next one waited for `--checkpoint-pages` more frames even when the WAL had started over
+  by itself.
+- `--checkpoint-idle-ms 0` made every write thread spin; it now turns the idle checkpoint off, and an idle write
+  thread with nothing to checkpoint sleeps until the next request.
+- A client that sent requests and never read the responses kept its connection for good; `--max-connections` such
+  clients locked everyone out. A response the client takes no data of for `--response-write-timeout-ms` now closes the
+  connection.
+- `Config::validate` checked lower bounds only: every numeric flag now has a range, so huge durations no longer panic
+  and negative SQLite limits (a negative `--max-like-pattern-bytes` kept SQLite's 50000) are refused at startup.
+  `--max-like-pattern-bytes` is at most 10000, the most whose matcher recursion fits on a 2 MiB stack.
+- A database created where a crash during a delete had left the old `-wal` took over the old content. Creating a
+  database now removes `-wal`, `-shm` and `-journal` files under its name first, and startup removes them for every
+  database whose main file is gone.
+- A first open cancelled with its request, followed by a `DELETE`, could create the deleted database again: the open
+  now runs and registers the database under the database's lock.
+- `dump_url`: `http://[::1]/x` without a port was refused; the user name and password of a refused URL, and control
+  characters in it, reached the log; the URL was fetched before the database name was checked, using up a one-time
+  token for a create that could not succeed.
+- Files of a build from a dump that crashed (`*.xsqld-loading*`) stayed until that name was created again; they are
+  removed at startup. `.sentinel` and its directory entry are synced when created.
+- Loading a dump had no limits: statements are limited to `--dump-load-max-statement-bytes` (a longer line is refused
+  before it is read in whole) and the load to `--dump-load-timeout-ms`, after which SQL still running is interrupted;
+  either way the create fails with 400 and leaves nothing. A trigger of many lines is no longer read again at every
+  line ending in `;`.
+- `--db-file-template` values that let databases share files (a file name ending in `{ns}`: the database `a-wal`
+  was the WAL of `a`) or leave `--db-path` are refused at startup, and the name `xsqld-tmp` is refused where it would
+  be the scratch directory (templates such as `{ns}/data`).
+- A trigger whose text starts with Unicode whitespace or a byte order mark was counted as several statements.
+- Dumps that did not load back: a view or index definition ending in a `--` comment (sqld loads these); text with a
+  NUL in it (now written as `CAST(X'…' AS TEXT)`); `sqlite_sequence` left over after its last AUTOINCREMENT table was
+  dropped. The last two fail on sqld too.
+- `ROLLBACK TRANSACTION <name> TO <savepoint>` was taken for a whole rollback.
+- Deferred foreign keys were checked per request; they are now checked where sqld checks them, at the commit of each
+  statement outside a transaction and at the client's `COMMIT`.
+- A write whose `RETURNING` rows exceeded `--max-response-bytes` was reported as failed but kept (sqld does the
+  same); it is now undone. `RESPONSE_TOO_LARGE` inside a batch fails the batch and stops it, as on sqld.
+- As on sqld 0.24.32: `;BEGIN` is `BEGIN`; a named parameter given twice counts once, with its last value; `close`
+  may follow `close`; base64 may end in any number of `=`; `ANALYZE` is refused; `PRAGMA threads`, `stats`,
+  `soft_heap_limit`, `hard_heap_limit` and `analysis_limit` can be read; a table expression named `replace` no longer
+  makes a `SELECT` count as an insert.
+
+### Tests
+
+- `tests/compare.py` counts a failed load on xsqld as a difference, compares `SQL_PARSE_ERROR` texts except for
+  syntax errors, has cases for PRAGMAs, temporary objects, savepoints, deferred foreign keys, the details above,
+  `RESPONSE_TOO_LARGE` and `preserve_row_ids`, and sends 48 requests at the same time to compare grouped execution.
+- The wall-clock limit of `statement_count_reads_the_text_once` is replaced by a count of the bytes read.
+
 ## [0.1.1] - 2026-11-11
 
 Fixes for the findings of an external test and a code review of 0.1.0. Upgrading needs no change for clients that
