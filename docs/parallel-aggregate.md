@@ -13,7 +13,7 @@ xsqld 0.1.3 runs an aggregate over a large table on several CPU cores: the rows 
 | the same with `WHERE status <> 'failed' … ORDER BY 2 DESC LIMIT 10` | 20.7 s | 6.03 s | **3.4×** |
 
 - More ranges scale further: with 8 (`--parallel-max-ranges 8`), measured directly in SQLite, 3.9 times for the filtered `COUNT` and 7.2 times for the `GROUP BY` (§2).
-- Everything else is as fast as before: point reads, aggregates on small tables, aggregates SQLite answers through an index, a bare `COUNT(*)` (0.09–0.23 ms at p50 over HTTP, within the noise between two runs; §5.2).
+- Everything else is as fast as before: point reads, aggregates on small tables and aggregates SQLite answers through an index (0.09–0.23 ms at p50 over HTTP, within the noise between two runs; §5.2), and a bare `COUNT(*)` (150 ms → 144 ms on the 100-million-row table; §5.1).
 - Beside four writers, twice as many aggregates finish in the same 30 s, the WAL grows less (largest 566 MiB → 317 MiB) and writes are as fast (§5.3).
 - Results are byte for byte the ones a single connection returns: statements for which that cannot be guaranteed are not split (README §3.1).
 - Measured on macOS only: no Linux, cloud-volume or cold-cache numbers yet.
