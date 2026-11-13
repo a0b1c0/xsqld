@@ -105,6 +105,8 @@ pub struct Exec<'c> {
     pub closed: bool,
     /// Bytes of row data still allowed in this HTTP response
     budget: u64,
+    /// Read pool of the request: aggregates of the shape split-range parallel aggregation takes run split there
+    parallel: Option<&'c crate::parallel::Ctx<'c>>,
 }
 
 pub type Results = Vec<StreamResult>;
@@ -117,7 +119,14 @@ impl<'c> Exec<'c> {
             client_tx: false,
             closed: false,
             budget,
+            parallel: None,
         }
+    }
+
+    /// Native mode on a connection of the read pool: aggregates may run split into ranges
+    pub fn with_parallel(mut self, ctx: &'c crate::parallel::Ctx<'c>) -> Self {
+        self.parallel = Some(ctx);
+        self
     }
 
     pub fn grouped(conn: &'c Conn, budget: u64) -> Self {
@@ -127,6 +136,7 @@ impl<'c> Exec<'c> {
             client_tx: false,
             closed: false,
             budget,
+            parallel: None,
         }
     }
 
@@ -305,6 +315,24 @@ impl<'c> Exec<'c> {
                 .execute_batch(&format!("SAVEPOINT {STMT_SP}"))
                 .map_err(|e| sql::rusqlite_error(&e))?;
         }
+        // outside a transaction only: inside one, every statement must see the transaction's own snapshot
+        if let Some(ctx) = self.parallel
+            && kind == Kind::Select
+            && self.conn.is_autocommit()
+            && let Some(done) = ctx.try_run(self.conn, &st, stmt, sql_text, &mut self.budget)
+        {
+            let (cols, rows) = done?;
+            return Ok(StmtResult {
+                cols,
+                rows_read: rows.len() as u64,
+                rows,
+                affected_row_count: 0,
+                last_insert_rowid: None,
+                replication_index: None,
+                rows_written: 0,
+                query_duration_ms: started.elapsed().as_micros() as f64 / 1000.0,
+            });
+        }
         let stepped = collect_rows(&mut st, &mut self.budget);
         if undoable {
             let undo = || {
@@ -355,7 +383,7 @@ impl<'c> Exec<'c> {
 
 /// Steps the statement to its end (it is reset when this returns): the rows, or the error, RESPONSE_TOO_LARGE once
 /// the rows pass the budget
-fn collect_rows(st: &mut Statement, budget: &mut u64) -> Result<Vec<Vec<Value>>, proto::Error> {
+pub fn collect_rows(st: &mut Statement, budget: &mut u64) -> Result<Vec<Vec<Value>>, proto::Error> {
     let mut rows = Vec::new();
     let mut q = st.raw_query();
     while let Some(row) = q.next().map_err(|e| sql::rusqlite_error(&e))? {
@@ -441,6 +469,31 @@ impl ToSql for Arg<'_> {
 /// Binds arguments with sqld's rules (`query.rs` `Params::bind`): more values than parameters is an error,
 /// a parameter without a value is an error (SQLite alone would bind NULL)
 fn bind(st: &mut Statement, stmt: &proto::Stmt) -> Result<(), proto::Error> {
+    let explain = st.is_explain() > 0;
+    for (index, value) in arg_values(st, stmt)?.into_iter().enumerate() {
+        match value {
+            Some(v) => st
+                .raw_bind_parameter(index + 1, Arg(v))
+                .map_err(|e| sql::rusqlite_error(&e))?,
+            None if explain => return Ok(()),
+            None => {
+                let which = st
+                    .parameter_name(index + 1)
+                    .map_or_else(|| (index + 1).to_string(), str::to_owned);
+                return Err(proto::Error::new(
+                    format!("Arguments do not match SQL parameters: value for parameter {which} not found"),
+                    "ARGS_INVALID",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The value of each parameter of `st` (index 1 first) by sqld's rules: positional values by position (`?NNN` by
+/// that number), named ones by name with or without its prefix, a name given twice taking its last value; None where
+/// the request has no value. Fails when the request has more values than the statement has parameters.
+pub fn arg_values<'s>(st: &Statement, stmt: &'s proto::Stmt) -> Result<Vec<Option<&'s Value>>, proto::Error> {
     let invalid = |m: String| proto::Error::new(format!("Arguments do not match SQL parameters: {m}"), "ARGS_INVALID");
     let named = !stmt.named_args.is_empty();
     // like sqld: a name given twice counts once, and its last value is used
@@ -471,9 +524,9 @@ fn bind(st: &mut Statement, stmt: &proto::Stmt) -> Result<(), proto::Error> {
         }
         stmt.named_args.iter().rev().find(|a| a.name == name).map(|a| &a.value)
     };
+    let mut out = Vec::with_capacity(count);
     for index in 1..=count {
-        let name = st.parameter_name(index).map(str::to_owned);
-        let value = match name.as_deref() {
+        out.push(match st.parameter_name(index) {
             Some(n) if n.starts_with('?') => {
                 let pos: usize = n[1..].parse().map_err(|_| {
                     invalid(format!(
@@ -484,16 +537,56 @@ fn bind(st: &mut Statement, stmt: &proto::Stmt) -> Result<(), proto::Error> {
             }
             Some(n) => by_name(n).or_else(|| by_name(&n[1..])),
             None => positional(index),
-        };
-        match value {
-            Some(v) => st
-                .raw_bind_parameter(index, Arg(v))
-                .map_err(|e| sql::rusqlite_error(&e))?,
-            None if st.is_explain() > 0 => return Ok(()),
-            None => {
-                let which = name.unwrap_or_else(|| index.to_string());
-                return Err(invalid(format!("value for parameter {which} not found")));
+        });
+    }
+    Ok(out)
+}
+
+/// Where a parameter of a statement built from a client's statement takes its value from
+#[derive(Clone, Copy)]
+pub enum Derived<'a> {
+    /// A value of the client's statement
+    Value(&'a Value),
+    /// The value of `extra[i]` (names the built statement adds)
+    Extra(usize),
+}
+
+/// The values of the parameters of `st`, built from `original` whose values are `values` (by index): `?NNN` takes
+/// value NNN, a name the value of the original's parameter of that name, an anonymous `?` the value of the same index
+/// (only in a statement whose text is the original's, such as its query plan), the names in `extra` their position
+/// there
+pub fn derived_args<'a>(
+    st: &Statement,
+    original: &Statement,
+    values: &[Option<&'a Value>],
+    extra: &[&str],
+) -> rusqlite::Result<Vec<Derived<'a>>> {
+    let mut out = Vec::with_capacity(st.parameter_count());
+    for index in 1..=st.parameter_count() {
+        let name = st.parameter_name(index).map(str::to_owned);
+        let at = match name.as_deref() {
+            Some(n) if extra.contains(&n) => {
+                out.push(Derived::Extra(extra.iter().position(|e| *e == n).unwrap_or_default()));
+                continue;
             }
+            Some(n) if n.starts_with('?') => n[1..].parse::<usize>().ok(),
+            Some(n) => original.parameter_index(n)?,
+            None => Some(index),
+        };
+        match at.and_then(|i| values.get(i.wrapping_sub(1)).copied().flatten()) {
+            Some(v) => out.push(Derived::Value(v)),
+            None => return Err(rusqlite::Error::InvalidParameterName(name.unwrap_or_default())),
+        }
+    }
+    Ok(out)
+}
+
+/// Binds what [`derived_args`] found, the extra names from `extra`
+pub fn bind_args(st: &mut Statement, args: &[Derived], extra: &[i64]) -> rusqlite::Result<()> {
+    for (i, a) in args.iter().enumerate() {
+        match a {
+            Derived::Value(v) => st.raw_bind_parameter(i + 1, Arg(v))?,
+            Derived::Extra(k) => st.raw_bind_parameter(i + 1, extra[*k])?,
         }
     }
     Ok(())

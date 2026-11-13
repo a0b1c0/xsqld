@@ -9,6 +9,56 @@ All notable changes to xsqld are documented in this file. The format is based on
 exposes them as `xsqld_build_info{version="…",commit="…"} 1`. Builds outside a git checkout can set
 `XSQLD_GIT_COMMIT`; without it and without git the commit reads `unknown`.
 
+## [0.1.3] - 2026-11-12
+
+Split-range parallel aggregation (README §3.1): an aggregate over a large table uses several CPU cores. Always on,
+nothing to configure: sqld's command line and every 0.1.2 default keep working, and results are byte for byte the
+ones a single connection returns (statements for which that cannot be guaranteed run as before).
+
+### Added
+
+- `COUNT(*)`, `COUNT(x)`, integer `SUM`, `MIN` and `MAX` over one ordinary rowid table, with or without `WHERE`,
+  `GROUP BY`, `HAVING`, `ORDER BY` and `LIMIT`, run on up to four read connections at once, each on a range of rowids,
+  all on one snapshot; SQLite combines the partial rows in an in-memory table. On a 100-million-row table (Apple M4
+  Max, through HTTP): a filtered `COUNT` 3.8 s → 1.3 s, a `GROUP BY` of 60 groups 22.9 s → 6.8 s; statements that are
+  not split are as fast as before (docs/parallel-aggregate.md).
+- Whether a table is large enough is decided by its rows, estimated from the rowid b-tree (16 parts looked at from
+  both ends, parts whose ends disagree halved; at most once every 10 s per table), not by the span of its rowids: a
+  table of 3000 rows with millisecond timestamps as ids used to be split on every request (p50 0.23 ms over HTTP,
+  0.14 ms without splitting).
+- Tuning flags with defaults that need no change: `--parallel-max-ranges` (4), `--parallel-min-rows` (1000000),
+  `--parallel-pool-percent` (50) and `--parallel-max-partial-rows` (1000000); README §2.1 lists their ranges. There is
+  no flag that turns splitting off.
+- Metrics `parallel_considered_total`, `parallel_runs_total`, `parallel_ranges_total`, `parallel_fallback_total` (by
+  `reason`) and `parallel_merge_*`.
+
+### Changed
+
+- The bundled SQLite is compiled with `-DSQLITE_ENABLE_SNAPSHOT` (`.cargo/config.toml`); `build.rs` refuses to build
+  without it on any target.
+
+### Tests
+
+- The shape parser takes the statements it should and refuses some 50 others (DISTINCT, AVG, window functions, CTEs,
+  joins, subqueries, bare columns, float sums, …); its tokenizer follows SQLite's.
+- Split results equal one connection's for 19 statements over four random data sets (NULLs, mixed case, holes and
+  negative rowids, text that is not UTF-8, `0.0` and `-0.0`); 20 kinds of statements run on one connection for the
+  reason expected, with the same result (REAL sums, sums that may overflow, NOCASE and untyped grouping columns,
+  views, virtual and `WITHOUT ROWID` tables, index plans, non-deterministic functions, too many groups, a busy pool).
+- Under writes that keep `COUNT(*)` and `SUM` constant, 150 of 150 split results show the constants (with each
+  connection on its own read transaction instead: 139 of 150 do not); the untouched-WAL rule, and a write landing in
+  it; a failing range stops the others at once, also one that had not started yet; the deadline; the read gate counts
+  a split statement as one read and a closed gate does not hold up its ranges.
+- Review of 0.1.3 (fixed before release): `ORDER BY rowid` (or `oid`, `_rowid_`) and double-quoted names of columns
+  outside `GROUP BY` in `HAVING` / `ORDER BY` were evaluated against the in-memory table and gave another order or
+  other groups; the in-memory database lacked the connections' limits (a `LIKE` pattern of 2000 bytes in `HAVING`
+  ran instead of failing, and one of some 40 KB could have overflowed the stack); a table rebuilt between the checks
+  and the snapshot was split as the old one. Each has a test.
+- Each of 28 protections was removed in turn: its test failed every time.
+- The row estimate is exact for dense rowids and for a few rows far from the rest, within 0.5% for evenly sparse ids
+  and clusters.
+- `tests/compare.py` compares 14 aggregates with sqld, 10 of them split on xsqld (with `--parallel-min-rows 1000`).
+
 ## [0.1.2] - 2026-11-12
 
 Fixes for the issues of the 0.1.0 code review that 0.1.1 left open (README §4.1 lists the few that remain). sqld's

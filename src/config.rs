@@ -161,6 +161,24 @@ pub struct Config {
     /// SQLITE_LIMIT_LIKE_PATTERN_LENGTH: longest LIKE or GLOB pattern (SQLite and sqld: 50000)
     #[arg(long, default_value_t = 1000)]
     pub max_like_pattern_bytes: i32,
+
+    /// Split-range parallel aggregation (README §3.1): most rowid ranges, each on its own read connection, one
+    /// statement is split into (also no more than the CPUs)
+    #[arg(long, default_value_t = 4)]
+    pub parallel_max_ranges: usize,
+    /// Split-range parallel aggregation: tables with fewer rows than this (estimated from the rowid b-tree) run on one
+    /// connection
+    #[arg(long, default_value_t = 1_000_000)]
+    pub parallel_min_rows: u64,
+    /// Split-range parallel aggregation: percentage of --read-pool-size that the additional connections of all split
+    /// statements together may hold; when that many are in use, or the pool has no idle permit, statements run on one
+    /// connection without waiting
+    #[arg(long, default_value_t = 50)]
+    pub parallel_pool_percent: usize,
+    /// Split-range parallel aggregation: most partial rows (groups times ranges) one statement may collect; past this
+    /// it is run again on one connection
+    #[arg(long, default_value_t = 1_000_000)]
+    pub parallel_max_partial_rows: usize,
 }
 
 #[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
@@ -224,6 +242,12 @@ impl Config {
     }
     pub fn response_write_timeout(&self) -> Duration {
         Duration::from_millis(self.response_write_timeout_ms)
+    }
+
+    /// Additional read connections all split statements of a database may hold together (at least one, so that a
+    /// pool of 16 at 10% still splits into two ranges)
+    pub fn parallel_permits(&self) -> usize {
+        (self.read_pool_size * self.parallel_pool_percent / 100).max(1)
     }
 
     /// Is a request with this Host header answered? (`--allowed-host-suffixes`)
@@ -328,7 +352,7 @@ impl Config {
     /// Every numeric flag with the range it must be in. Upper bounds keep durations from overflowing the clock
     /// (`Instant + Duration` panics), counts within what a semaphore holds, and sizes and SQLite limits in a range
     /// where they still limit something (SQLite ignores a negative limit and keeps its own default)
-    fn numeric_bounds(&self) -> [(&'static str, i128, i128, i128); 31] {
+    fn numeric_bounds(&self) -> [(&'static str, i128, i128, i128); 35] {
         const HOUR_MS: i128 = 3_600_000;
         const GIB: i128 = 1 << 30;
         let n = |v: usize| v as i128;
@@ -397,6 +421,16 @@ impl Config {
                 self.max_like_pattern_bytes as i128,
                 1,
                 MAX_LIKE_PATTERN_BYTES as i128,
+            ),
+            // at least two ranges: below that there is nothing to split (there is no setting that turns it off)
+            ("parallel-max-ranges", n(self.parallel_max_ranges), 2, 64),
+            ("parallel-min-rows", u(self.parallel_min_rows), 1000, 1 << 50),
+            ("parallel-pool-percent", n(self.parallel_pool_percent), 10, 90),
+            (
+                "parallel-max-partial-rows",
+                n(self.parallel_max_partial_rows),
+                1000,
+                100_000_000,
             ),
         ]
     }

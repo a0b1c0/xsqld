@@ -2,5 +2,8 @@
 # HAVE_FDATASYNC: without it SQLite syncs with fsync() on Linux, which also flushes the inode's timestamps through the
 # file system journal on every commit. With synchronous=FULL that is one journal commit per group; fdatasync() of a
 # WAL frame written over already allocated blocks skips it. build.rs refuses to build for Linux without this flag.
+# SQLITE_ENABLE_SNAPSHOT: sqlite3_snapshot_get / sqlite3_snapshot_open, which put the read connections of a split
+# aggregate on one snapshot (README §3.1); rusqlite's `bundled` build leaves them out, and xsqld does not link without
+# them. build.rs refuses to build on any target without this flag.
 [env]
-LIBSQLITE3_FLAGS = "-DHAVE_FDATASYNC=1"
+LIBSQLITE3_FLAGS = "-DHAVE_FDATASYNC=1 -DSQLITE_ENABLE_SNAPSHOT"

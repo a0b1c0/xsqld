@@ -7,7 +7,8 @@ null); rows_read / rows_written (sqld: libsql's own counters; the runtime only c
 values (random on both sides; only null vs. non-null is compared); the message text of syntax errors (sqld uses its
 own parser; SQL_PARSE_ERROR for unsupported statements is compared word for word).
 
-Also compared: requests sent at the same time (xsqld runs them in one group transaction, sqld one by one), each
+Also compared: aggregates xsqld splits into rowid ranges (README §3.1; needs --parallel-min-rows 1000 on xsqld, the
+comparison fails otherwise); requests sent at the same time (xsqld runs them in one group transaction, sqld one by one), each
 touching rows of its own so that every order gives the same results; GET /dump with and without preserve_row_ids;
 databases created from dumps (a load that fails on xsqld counts as a difference).
 
@@ -15,7 +16,7 @@ Usage:
   docker run -d --name e415-sqld -p 127.0.0.1:18080:8080 -p 127.0.0.1:18081:8081 --entrypoint /bin/sqld \
       ghcr.io/tursodatabase/libsql-server:v0.24.32 --enable-namespaces --http-listen-addr 0.0.0.0:8080 \
       --admin-listen-addr 0.0.0.0:8081
-  xsqld --db-path /tmp/x --http-listen-addr 127.0.0.1:28080 --admin-listen-addr 127.0.0.1:28081
+  xsqld --db-path /tmp/x --http-listen-addr 127.0.0.1:28080 --admin-listen-addr 127.0.0.1:28081 --parallel-min-rows 1000
   python3 tests/compare.py   [--sqld 127.0.0.1:18080 --sqld-admin 127.0.0.1:18081 --xsqld 127.0.0.1:28080 --xsqld-admin 127.0.0.1:28081]
 """
 
@@ -270,6 +271,51 @@ CASES = {
 }
 
 
+# Split-range parallel aggregation (README §3.1): the statements xsqld splits must return what sqld returns. xsqld only
+# splits tables of at least --parallel-min-rows rowids (1 000 000 by default); start it with --parallel-min-rows 1000
+# so that these 6000 rows are split (the check below says so when they were not).
+AGG_ROWS = ("WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 6000) "
+            "INSERT INTO agg(id, g, s, v, w) SELECT i * 3 - 9000, CASE WHEN i % 17 = 0 THEN NULL ELSE i % 7 - 3 END, "
+            "CASE i % 5 WHEN 0 THEN 'a' WHEN 1 THEN 'B' WHEN 2 THEN 'b' WHEN 3 THEN NULL ELSE 'ab' END, "
+            "CASE WHEN i % 11 = 0 THEN NULL ELSE (i * 7919) % 2001 - 1000 END, (i * 31) % 5 FROM n")
+AGG_SPLIT = [
+    ex("SELECT COUNT(*) FROM agg WHERE v > ?", i(0)),
+    ex("SELECT g, COUNT(*), SUM(v), MIN(v), MAX(v), COUNT(w) FROM agg GROUP BY g"),
+    ex("SELECT s, COUNT(*) AS c FROM agg WHERE v IS NOT NULL GROUP BY s HAVING COUNT(*) > 2 ORDER BY c DESC, s LIMIT 5"),
+    ex("SELECT g, s, SUM(v) FROM agg GROUP BY g, s ORDER BY 3 DESC, 1, 2 LIMIT ? OFFSET 1", i(4)),
+    ex("SELECT MAX(s), MIN(s), COUNT(s) FROM agg WHERE g = :g", named={"g": i(1)}),
+    ex("SELECT COUNT(*), SUM(CASE WHEN s = 'a' THEN 1 ELSE 0 END) FROM agg WHERE v < 900"),
+    ex("SELECT g AS grp, SUM(v) total FROM agg GROUP BY g HAVING SUM(v) > 0 AND g IS NOT NULL"),
+    ex("SELECT q.g, COUNT(*) FROM agg AS q WHERE q.s LIKE 'a%' GROUP BY q.g ORDER BY COUNT(*) DESC, 1"),
+    ex("SELECT g, COUNT(*) FROM agg GROUP BY g LIMIT 3"),
+    ex("SELECT COUNT(*), SUM(v), MIN(s) FROM agg WHERE v > 2000"),
+]
+# not split (a REAL sum, an index scan, a sum that may overflow): still the same as sqld
+AGG_UNSPLIT = [
+    ex("SELECT g, SUM(v * 0.5) FROM agg GROUP BY g"),
+    ex("SELECT g, SUM(r) FROM agg GROUP BY g"),
+    ex("SELECT w, COUNT(*) FROM agg GROUP BY w"),
+    ex("SELECT SUM(big) FROM agg WHERE g = 1"),
+]
+
+
+def split_cases(a, b):
+    out = {}
+    setup = [ex("CREATE TABLE agg(id INTEGER PRIMARY KEY, g INTEGER, s TEXT, v INTEGER, w INTEGER, r REAL, big INTEGER)"),
+             ex(AGG_ROWS), ex("UPDATE agg SET r = v / 7.0, big = 4000000000000000000"), ex("CREATE INDEX agg_w ON agg(w)")]
+    for s in (a, b):
+        s.pipeline(setup, None)
+    for n, stmt in enumerate(AGG_SPLIT + AGG_UNSPLIT):
+        ra = normalize(*a.pipeline([stmt], None))
+        rb = normalize(*b.pipeline([stmt], None))
+        if ra != rb:
+            out[f"aggregate {n}: {stmt['stmt']['sql']}"] = (ra, rb)
+    _, metrics = request(b.addr, "GET", "/metrics", host=f"{b.ns}.db")
+    runs = [line for line in metrics.decode().splitlines() if line.startswith(f'xsqld_parallel_runs_total{{ns="{b.ns}"}}')]
+    split = int(runs[0].split()[-1]) if runs else 0
+    return out, split
+
+
 def concurrent_cases(a, b, n=48):
     """Requests sent at the same time, each on its own rows: xsqld runs them in one group transaction (each in a
     savepoint), sqld one after the other; any order gives the same results. sqld's answers for contention (busy, or
@@ -472,6 +518,15 @@ def main():
         print(f"dump  {k}: {v}")
         if v is False:
             failed += 1
+    agg, split = split_cases(a, b)
+    for k, (va, vb) in agg.items():
+        failed += 1
+        print(f"DIFF  {k}\n     sqld : {json.dumps(va, ensure_ascii=False)[:1500]}\n     xsqld: {json.dumps(vb, ensure_ascii=False)[:1500]}")
+    if not agg:
+        print(f"same  {len(AGG_SPLIT) + len(AGG_UNSPLIT)} aggregates ({split} of them split on xsqld)")
+    if split < len(AGG_SPLIT):
+        failed += 1
+        print(f"NOTE  only {split} of {len(AGG_SPLIT)} aggregates split: start xsqld with --parallel-min-rows 1000")
     grouped = concurrent_cases(a, b)
     for k, (va, vb) in grouped.items():
         failed += 1

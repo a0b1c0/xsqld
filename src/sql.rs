@@ -585,6 +585,187 @@ pub fn head(sql: &str) -> String {
     out
 }
 
+/// Kind of a [`Token`]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokKind {
+    /// Keyword or bare name (`select`, `calls`, `_rowid_`)
+    Word,
+    /// Name in `"…"`, `` `…` `` or `[…]` (a `"…"` that names nothing is a string to SQLite: callers that need the
+    /// difference check the name against the schema)
+    Quoted,
+    /// `'…'`
+    Str,
+    /// `x'…'`
+    Blob,
+    /// Integer literal (decimal or hexadecimal)
+    Int,
+    /// Literal with a `.` or an exponent
+    Float,
+    /// Bound parameter: `?`, `?NNN`, `:name`, `@name`, `$name`
+    Var,
+    /// Operator or punctuation (one to three characters)
+    Op,
+}
+
+/// A token of SQL text, as SQLite's tokenizer (`tokenize.c`) splits it; `start..end` are byte offsets
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Token {
+    pub kind: TokKind,
+    pub start: usize,
+    pub end: usize,
+}
+
+/// Characters SQLite allows inside names (`IdChar`): ASCII letters, digits, `_`, `$` and every byte of a multi-byte
+/// UTF-8 character
+fn id_char(c: u8) -> bool {
+    c.is_ascii_alphanumeric() || c == b'_' || c == b'$' || c >= 0x80
+}
+
+/// Splits one statement into tokens the way SQLite does, dropping whitespace and comments. None for text this
+/// tokenizer does not take apart with certainty: a NUL, an unterminated quote, digit separators in numbers, Tcl-style
+/// parameters (`$a::b`, `$a(x)`), `#` and anything SQLite itself calls an illegal token. Callers use it to decide
+/// whether a statement has a shape they handle specially; None means "not this shape", never an error.
+pub fn tokenize(sql: &str) -> Option<Vec<Token>> {
+    let s = sql.as_bytes();
+    if s.contains(&0) {
+        return None;
+    }
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < s.len() {
+        let c = s[i];
+        let start = i;
+        let at = |j: usize| s.get(j).copied().unwrap_or(0);
+        let kind = match c {
+            // sqlite3Isspace: space, \t, \n, \v, \f, \r
+            b' ' | b'\t' | b'\n' | 0x0B | 0x0C | b'\r' => {
+                i += 1;
+                continue;
+            }
+            b'-' if at(i + 1) == b'-' => {
+                while i < s.len() && s[i] != b'\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            b'/' if at(i + 1) == b'*' => {
+                match s[i + 2..].windows(2).position(|w| w == b"*/") {
+                    Some(p) => i += p + 4,
+                    // an unterminated comment runs to the end, as in SQLite
+                    None => i = s.len(),
+                }
+                continue;
+            }
+            b'\'' | b'"' | b'`' => {
+                i += 1;
+                loop {
+                    match s.get(i) {
+                        None => return None,
+                        Some(&q) if q == c => {
+                            if at(i + 1) == c {
+                                i += 2;
+                            } else {
+                                i += 1;
+                                break;
+                            }
+                        }
+                        Some(_) => i += 1,
+                    }
+                }
+                if c == b'\'' { TokKind::Str } else { TokKind::Quoted }
+            }
+            b'[' => {
+                i += s[i..].iter().position(|&b| b == b']')? + 1;
+                TokKind::Quoted
+            }
+            b'x' | b'X' if at(i + 1) == b'\'' => {
+                i += 2;
+                while at(i).is_ascii_hexdigit() {
+                    i += 1;
+                }
+                if at(i) != b'\'' || (i - start - 2) % 2 == 1 {
+                    return None;
+                }
+                i += 1;
+                TokKind::Blob
+            }
+            b'0'..=b'9' | b'.' if c != b'.' || at(i + 1).is_ascii_digit() => {
+                let mut kind = TokKind::Int;
+                if c == b'0' && matches!(at(i + 1), b'x' | b'X') && at(i + 2).is_ascii_hexdigit() {
+                    i += 2;
+                    while at(i).is_ascii_hexdigit() {
+                        i += 1;
+                    }
+                } else {
+                    while at(i).is_ascii_digit() {
+                        i += 1;
+                    }
+                    if at(i) == b'.' {
+                        kind = TokKind::Float;
+                        i += 1;
+                        while at(i).is_ascii_digit() {
+                            i += 1;
+                        }
+                    }
+                    if matches!(at(i), b'e' | b'E')
+                        && (at(i + 1).is_ascii_digit()
+                            || (matches!(at(i + 1), b'+' | b'-') && at(i + 2).is_ascii_digit()))
+                    {
+                        kind = TokKind::Float;
+                        i += 2;
+                        while at(i).is_ascii_digit() {
+                            i += 1;
+                        }
+                    }
+                }
+                // `12abc` is an illegal token, `1_000` a number with digit separators: neither is handled here
+                if id_char(at(i)) {
+                    return None;
+                }
+                kind
+            }
+            b'?' => {
+                i += 1;
+                while at(i).is_ascii_digit() {
+                    i += 1;
+                }
+                TokKind::Var
+            }
+            b':' | b'@' | b'$' => {
+                i += 1;
+                while id_char(at(i)) {
+                    i += 1;
+                }
+                if i == start + 1 || matches!(at(i), b'(' | b':') {
+                    return None;
+                }
+                TokKind::Var
+            }
+            c if c.is_ascii_alphabetic() || c == b'_' || c >= 0x80 => {
+                while id_char(at(i)) {
+                    i += 1;
+                }
+                TokKind::Word
+            }
+            _ => {
+                const OPS: [&[u8]; 14] = [
+                    b"->>", b"->", b"||", b"<=", b">=", b"<>", b"!=", b"==", b"<<", b">>", b"<", b">", b"=", b"|",
+                ];
+                if let Some(op) = OPS.iter().find(|op| s[i..].starts_with(op)) {
+                    i += op.len();
+                } else if b"+-*/%&~,();.".contains(&c) {
+                    i += 1;
+                } else {
+                    return None;
+                }
+                TokKind::Op
+            }
+        };
+        out.push(Token { kind, start, end: i });
+    }
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

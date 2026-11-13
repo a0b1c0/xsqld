@@ -16,6 +16,12 @@ fn main() {
              applies, or set the variable yourself"
         );
     }
+    if !flags.split_whitespace().any(|f| f == "-DSQLITE_ENABLE_SNAPSHOT") {
+        panic!(
+            "LIBSQLITE3_FLAGS lacks -DSQLITE_ENABLE_SNAPSHOT (split aggregates need sqlite3_snapshot_open): run cargo \
+             inside the xsqld directory so that .cargo/config.toml applies, or set the variable yourself"
+        );
+    }
     println!("cargo:rustc-env=XSQLD_SQLITE_FLAGS={flags}");
 
     println!("cargo:rerun-if-env-changed=XSQLD_GIT_COMMIT");

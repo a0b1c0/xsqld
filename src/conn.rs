@@ -121,13 +121,7 @@ impl Conn {
             }),
         )?;
         c.set_prepared_statement_cache_capacity(256);
-        // ATTACH is not allowed (sqld: allow_attach defaults to false)
-        c.set_limit(Limit::SQLITE_LIMIT_ATTACHED, 0)?;
-        c.set_limit(Limit::SQLITE_LIMIT_LENGTH, cfg.max_value_bytes)?;
-        // SQLite's default is 50000 bytes: its matcher recurses once per `%` (a pattern of some 40 KB overflows the
-        // stack of a thread and takes the process down) and runs for minutes on a long pattern without reaching the
-        // progress handler, so no deadline stops it
-        c.set_limit(Limit::SQLITE_LIMIT_LIKE_PATTERN_LENGTH, cfg.max_like_pattern_bytes)?;
+        apply_limits(&c, cfg)?;
         let conn = Conn {
             c,
             deadline,
@@ -169,6 +163,12 @@ impl Conn {
         self.deadline.store(v, Ordering::Relaxed);
     }
 
+    /// Stops the SQL running on this connection from another thread, and any it starts until the deadline is set
+    /// again: unlike `sqlite3_interrupt`, which a statement starting after it no longer sees
+    pub fn stopper(&self) -> Stopper {
+        Stopper(self.deadline.clone())
+    }
+
     pub fn is_autocommit(&self) -> bool {
         self.c.is_autocommit()
     }
@@ -199,6 +199,29 @@ impl Conn {
         if !self.c.is_autocommit() {
             let _ = self.c.execute_batch("ROLLBACK");
         }
+    }
+}
+
+/// SQLite limits of every connection that runs client SQL: the database connections, and the in-memory database where
+/// split aggregates are combined (their `HAVING` and `ORDER BY` run there)
+pub fn apply_limits(c: &Connection, cfg: &Config) -> rusqlite::Result<()> {
+    // ATTACH is not allowed (sqld: allow_attach defaults to false)
+    c.set_limit(Limit::SQLITE_LIMIT_ATTACHED, 0)?;
+    c.set_limit(Limit::SQLITE_LIMIT_LENGTH, cfg.max_value_bytes)?;
+    // SQLite's default is 50000 bytes: its matcher recurses once per `%` (a pattern of some 40 KB overflows the
+    // stack of a thread and takes the process down) and runs for minutes on a long pattern without reaching the
+    // progress handler, so no deadline stops it
+    c.set_limit(Limit::SQLITE_LIMIT_LIKE_PATTERN_LENGTH, cfg.max_like_pattern_bytes)?;
+    Ok(())
+}
+
+/// See [`Conn::stopper`]
+pub struct Stopper(Arc<AtomicU64>);
+
+impl Stopper {
+    pub fn stop(&self) {
+        // any moment in the past: the progress handler ends what runs within 1000 instructions
+        self.0.store(1, Ordering::Relaxed);
     }
 }
 

@@ -62,6 +62,62 @@ pub struct DbMetrics {
     pub queue_timeouts: AtomicU64,
     pub queue_full: AtomicU64,
     pub deadline_exceeded: AtomicU64,
+    /// Split-range parallel aggregation (README §3.1): statements of the shape it takes
+    pub parallel_considered: AtomicU64,
+    /// … run split into ranges, and the ranges they ran
+    pub parallel_runs: AtomicU64,
+    pub parallel_ranges: AtomicU64,
+    /// … run on one connection instead, by reason ([`Fallback`])
+    pub parallel_fallback: [AtomicU64; Fallback::ALL.len()],
+    /// … time to combine the partial rows
+    pub parallel_merge: Timer,
+}
+
+/// Why a statement of the shape split-range parallel aggregation takes ran on one connection
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fallback {
+    /// The table has fewer rows than `--parallel-min-rows` (by the span of its rowids or the estimate)
+    Small,
+    /// Not an ordinary rowid table, or its columns do not allow an exact split (collation, affinity, names)
+    Table,
+    /// SQLite's plan or compiled program is not the one splitting keeps (an index is used, an unlisted function, …)
+    Plan,
+    /// No additional read connection free right away (or a single CPU)
+    Pool,
+    /// The connections could not be put on one snapshot
+    Snapshot,
+    /// Run again after splitting: a sum that is not an integer or could overflow in some order
+    Inexact,
+    /// Run again after splitting: more partial rows than `--parallel-max-partial-rows`
+    Rows,
+    /// Run again after splitting: a range failed (an error, the deadline) or the combining failed
+    Error,
+}
+
+impl Fallback {
+    pub const ALL: [Fallback; 8] = [
+        Fallback::Small,
+        Fallback::Table,
+        Fallback::Plan,
+        Fallback::Pool,
+        Fallback::Snapshot,
+        Fallback::Inexact,
+        Fallback::Rows,
+        Fallback::Error,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Fallback::Small => "small",
+            Fallback::Table => "table",
+            Fallback::Plan => "plan",
+            Fallback::Pool => "pool",
+            Fallback::Snapshot => "snapshot",
+            Fallback::Inexact => "inexact",
+            Fallback::Rows => "rows",
+            Fallback::Error => "error",
+        }
+    }
 }
 
 impl DbMetrics {
@@ -86,6 +142,17 @@ impl DbMetrics {
         put(out, "queue_timeouts_total", ns, u(&self.queue_timeouts));
         put(out, "queue_full_total", ns, u(&self.queue_full));
         put(out, "deadline_exceeded_total", ns, u(&self.deadline_exceeded));
+        put(out, "parallel_considered_total", ns, u(&self.parallel_considered));
+        put(out, "parallel_runs_total", ns, u(&self.parallel_runs));
+        put(out, "parallel_ranges_total", ns, u(&self.parallel_ranges));
+        for (f, n) in Fallback::ALL.iter().zip(&self.parallel_fallback) {
+            let _ = writeln!(
+                out,
+                "xsqld_parallel_fallback_total{{ns=\"{ns}\",reason=\"{}\"}} {}",
+                f.label(),
+                u(n)
+            );
+        }
         for (name, t) in [
             ("commit", &self.commit),
             ("checkpoint_passive", &self.checkpoint_passive),
@@ -93,6 +160,7 @@ impl DbMetrics {
             ("checkpoint_wait", &self.checkpoint_wait),
             ("checkpoint_gate", &self.checkpoint_gate),
             ("read_gate_wait", &self.read_gate_wait),
+            ("parallel_merge", &self.parallel_merge),
         ] {
             put(out, &format!("{name}_count"), ns, u(&t.count));
             put(out, &format!("{name}_seconds_sum"), ns, Secs(u(&t.sum_us)));
@@ -143,8 +211,11 @@ mod tests {
         assert!(out.contains("xsqld_commit_count{ns=\"tenant\"} 2\n"));
         assert!(out.contains("xsqld_commit_seconds_sum{ns=\"tenant\"} 0.008000\n"));
         assert!(out.contains("xsqld_commit_seconds_max{ns=\"tenant\"} 0.005000\n"));
+        m.parallel_fallback[Fallback::Pool as usize].fetch_add(1, Relaxed);
+        assert!(out.contains("xsqld_parallel_fallback_total{ns=\"tenant\",reason=\"small\"} 0\n"));
         let mut again = String::new();
         m.render("tenant", &mut again);
         assert!(again.contains("xsqld_commit_seconds_max{ns=\"tenant\"} 0.000000\n"));
+        assert!(again.contains("xsqld_parallel_fallback_total{ns=\"tenant\",reason=\"pool\"} 1\n"));
     }
 }

@@ -25,7 +25,41 @@ pub struct Readers {
     cfg: Arc<Config>,
     idle: Mutex<Vec<Conn>>,
     permits: Arc<Semaphore>,
+    /// Additional connections split statements may hold, all together (`--parallel-pool-percent`)
+    parallel_permits: Arc<Semaphore>,
+    /// Statements (by text) not split for a reason that will recur: too many groups, sums that are not exact integers
+    /// (both found by splitting), or a table or plan that does not allow it, with the schema version it was found at
+    unsplittable: Mutex<std::collections::HashMap<String, (crate::metrics::Fallback, Option<i64>)>>,
+    /// Estimated rows of tables (by name) and when they were estimated (split aggregates: whether a table is large)
+    sizes: Mutex<std::collections::HashMap<String, (Option<i128>, Instant)>>,
     pub gate: Arc<ReadGate>,
+}
+
+/// How long an estimate of a table's rows is used before it is made again: tables grow slowly, and missing the moment
+/// a table grows past `--parallel-min-rows` by this much only delays splitting
+const SIZE_TTL: Duration = Duration::from_secs(10);
+
+/// Most statement texts remembered as not worth splitting; the list starts over when full
+const UNSPLITTABLE_MAX: usize = 1024;
+
+/// Additional read connections lent to one split statement (README §3.1); back to the pool when dropped
+pub struct Lease<'r> {
+    readers: &'r Readers,
+    pub conns: Vec<Conn>,
+    _permits: (tokio::sync::SemaphorePermit<'r>, tokio::sync::SemaphorePermit<'r>),
+}
+
+impl Drop for Lease<'_> {
+    fn drop(&mut self) {
+        let mut idle = self.readers.idle.lock();
+        for c in self.conns.drain(..) {
+            c.set_deadline(None);
+            // one whose read transaction could not be ended is closed, never lent again with an old snapshot
+            if c.is_autocommit() {
+                idle.push(c);
+            }
+        }
+    }
 }
 
 /// Holds back new read transactions of one database while the write thread runs a RESTART checkpoint that keeps
@@ -45,7 +79,7 @@ pub struct Readers {
 pub struct ReadGate {
     state: Mutex<GateState>,
     changed: Condvar,
-    metrics: Arc<DbMetrics>,
+    pub metrics: Arc<DbMetrics>,
 }
 
 #[derive(Default)]
@@ -120,6 +154,12 @@ impl ReadGate {
         Some(ReadPass(self))
     }
 
+    /// Read requests that passed the gate and are still running
+    #[cfg(test)]
+    pub fn active(&self) -> usize {
+        self.state.lock().active
+    }
+
     /// Closes the gate: read requests arriving from now on wait until the returned guard is dropped
     pub fn close(&self) -> ClosedGate<'_> {
         self.state.lock().closed = true;
@@ -142,11 +182,84 @@ impl Readers {
         let n = cfg.read_pool_size;
         Self {
             path,
-            cfg,
             idle: Mutex::new(Vec::with_capacity(n)),
             permits: Arc::new(Semaphore::new(n)),
+            parallel_permits: Arc::new(Semaphore::new(cfg.parallel_permits())),
+            unsplittable: Mutex::new(std::collections::HashMap::new()),
+            sizes: Mutex::new(std::collections::HashMap::new()),
+            cfg,
             gate,
         }
+    }
+
+    #[cfg(test)]
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
+    pub fn cfg(&self) -> &Config {
+        &self.cfg
+    }
+
+    /// Estimated rows of `table`: made by `estimate` at most every [`SIZE_TTL`] per table
+    pub fn table_rows(&self, table: &str, estimate: impl FnOnce() -> Option<i128>) -> Option<i128> {
+        let key = table.to_ascii_lowercase();
+        if let Some((n, at)) = self.sizes.lock().get(&key)
+            && at.elapsed() < SIZE_TTL
+        {
+            return *n;
+        }
+        let n = estimate();
+        let mut m = self.sizes.lock();
+        if m.len() >= UNSPLITTABLE_MAX {
+            m.clear();
+        }
+        m.insert(key, (n, Instant::now()));
+        n
+    }
+
+    pub fn unsplittable(&self, sql: &str) -> Option<(crate::metrics::Fallback, Option<i64>)> {
+        self.unsplittable.lock().get(sql).copied()
+    }
+
+    pub fn mark_unsplittable(&self, sql: &str, why: crate::metrics::Fallback, schema: Option<i64>) {
+        let mut m = self.unsplittable.lock();
+        if m.len() >= UNSPLITTABLE_MAX {
+            m.clear();
+        }
+        // statements longer than the cache limit of compiled statements carry their values inline and do not repeat
+        if sql.len() <= 8 * 1024 {
+            m.insert(sql.to_owned(), (why, schema));
+        }
+    }
+
+    pub fn metrics(&self) -> &DbMetrics {
+        &self.gate.metrics
+    }
+
+    /// Up to `want` additional connections for a split statement, as many as are free right now (never waiting),
+    /// with `deadline` set; None if not even one is
+    pub fn lease_extra(&self, want: usize, deadline: Instant) -> Option<Lease<'_>> {
+        let (share, pool) = (1..=want as u32).rev().find_map(|k| {
+            let share = self.parallel_permits.try_acquire_many(k).ok()?;
+            let pool = self.permits.try_acquire_many(k).ok()?;
+            Some((share, pool))
+        })?;
+        let k = pool.num_permits();
+        let mut conns = Vec::with_capacity(k);
+        while conns.len() < k {
+            let c = match self.idle.lock().pop() {
+                Some(c) => c,
+                None => Conn::open_reader(&self.path, &self.cfg).ok()?,
+            };
+            c.set_deadline(Some(deadline));
+            conns.push(c);
+        }
+        Some(Lease {
+            readers: self,
+            conns,
+            _permits: (share, pool),
+        })
     }
 
     pub async fn run(self: &Arc<Self>, requests: Vec<StreamRequest>, deadline: Instant) -> anyhow::Result<ReadOutcome> {
@@ -164,7 +277,11 @@ impl Readers {
                 Some(c) => c,
                 None => Conn::open_reader(&this.path, &this.cfg)?,
             };
-            let out = run_read(&conn, requests, deadline, this.cfg.max_response_bytes);
+            let ctx = crate::parallel::Ctx {
+                readers: &this,
+                deadline,
+            };
+            let out = run_read(&conn, requests, deadline, this.cfg.max_response_bytes, &ctx);
             this.idle.lock().push(conn);
             Ok(out)
         })
@@ -182,7 +299,13 @@ pub fn looks_read_only(requests: &[StreamRequest]) -> bool {
     })
 }
 
-fn run_read(conn: &Conn, requests: Vec<StreamRequest>, deadline: Instant, budget: u64) -> ReadOutcome {
+fn run_read(
+    conn: &Conn,
+    requests: Vec<StreamRequest>,
+    deadline: Instant,
+    budget: u64,
+    ctx: &crate::parallel::Ctx<'_>,
+) -> ReadOutcome {
     // statements that fail before running give the same error on either side
     let read_only = exec::statements(&requests).all(|s| {
         sql::classify(s) == Kind::Empty || sql::many_statements(s) || conn.prepare(s).is_ok_and(|st| st.readonly())
@@ -191,7 +314,7 @@ fn run_read(conn: &Conn, requests: Vec<StreamRequest>, deadline: Instant, budget
         return ReadOutcome::NeedsWriter(requests);
     }
     conn.set_deadline(Some(deadline));
-    let mut ex = Exec::native(conn, budget);
+    let mut ex = Exec::native(conn, budget).with_parallel(ctx);
     let results = match ex.run(&requests) {
         Ok(r) => r,
         Err(_) => unreachable!("native execution has no group"),
