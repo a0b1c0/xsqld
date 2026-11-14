@@ -5,6 +5,8 @@ use std::collections::HashMap;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::time::Instant;
 
 use tokio::sync::Mutex as AsyncMutex;
 
@@ -28,12 +30,17 @@ pub struct Db {
     pub writer: Writer,
     pub readers: Arc<Readers>,
     pub metrics: Arc<DbMetrics>,
+    /// When a request last asked for this database, in milliseconds since the registry was made (`--idle-close-ms`)
+    last_used: AtomicU64,
 }
 
 pub struct Registry {
     pub cfg: Arc<Config>,
     pub streams: Arc<Streams>,
     open: Arc<parking_lot::RwLock<HashMap<Arc<str>, Arc<Db>>>>,
+    started: Instant,
+    /// Databases closed for being idle (`--idle-close-ms`)
+    pub idle_closed: AtomicU64,
     /// Per database: opening, creating and deleting it, one at a time (other databases are not held up, e.g. while
     /// one is built from a long dump). Opening, creating and deleting hand the guard to their blocking work, so a
     /// cancelled HTTP request cannot let a second one start while the first is still running. An entry lives only
@@ -69,6 +76,8 @@ impl Registry {
             cfg,
             streams,
             open: Default::default(),
+            started: Instant::now(),
+            idle_closed: AtomicU64::new(0),
             locks: Default::default(),
             #[cfg(test)]
             open_delay: Default::default(),
@@ -98,7 +107,9 @@ impl Registry {
 
     /// The open database, opening it if its file exists; None if it does not exist
     pub async fn get(&self, ns: &str) -> anyhow::Result<Option<Arc<Db>>> {
+        let now = self.now_ms();
         if let Some(db) = self.open.read().get(ns) {
+            db.last_used.store(now, Relaxed);
             return Ok(Some(db.clone()));
         }
         if !self.exists(ns) {
@@ -106,6 +117,7 @@ impl Registry {
         }
         let guard = self.lock(ns).await;
         if let Some(db) = self.open.read().get(ns) {
+            db.last_used.store(now, Relaxed);
             return Ok(Some(db.clone()));
         }
         self.start(ns, guard).await
@@ -119,6 +131,7 @@ impl Registry {
         let path = self.path(ns);
         let name: Arc<str> = ns.into();
         let (cfg, streams, open) = (self.cfg.clone(), self.streams.clone(), self.open.clone());
+        let now = self.now_ms();
         #[cfg(test)]
         let delay = std::time::Duration::from_millis(self.open_delay.load(std::sync::atomic::Ordering::Relaxed));
         tokio::task::spawn_blocking(move || -> anyhow::Result<Option<Arc<Db>>> {
@@ -137,12 +150,70 @@ impl Registry {
                 writer,
                 readers: Arc::new(Readers::new(path, cfg, gate)),
                 metrics,
+                last_used: AtomicU64::new(now),
             });
             open.write().insert(name.clone(), db.clone());
             tracing::info!(ns = &*name, "database opened");
             Ok(Some(db))
         })
         .await?
+    }
+
+    fn now_ms(&self) -> u64 {
+        self.started.elapsed().as_millis() as u64
+    }
+
+    /// Closes the databases no request has asked for in `--idle-close-ms`: the writer is stopped (which checkpoints
+    /// the WAL into the database file) and the connections are closed, so an unused database holds no memory and no
+    /// file descriptors. The next request opens it again like a first request after a start.
+    ///
+    /// A database is only closed when nobody can notice: no request holds it (the map's reference is the only one,
+    /// checked under the map's write lock, where no request can take another), nothing is queued or running on its
+    /// writer, and no stream holds a transaction open on it. The close runs under the database's lock, so a request
+    /// arriving meanwhile waits for it and then opens the database anew. Returns how many were closed.
+    pub async fn close_idle(&self) -> usize {
+        let limit = self.cfg.idle_close_ms;
+        if limit == 0 {
+            return 0;
+        }
+        let idle = |db: &Arc<Db>, now: u64| {
+            Arc::strong_count(db) == 1
+                && now.saturating_sub(db.last_used.load(Relaxed)) >= limit
+                && db.writer.is_quiet()
+        };
+        let now = self.now_ms();
+        let names: Vec<Arc<str>> = self
+            .open
+            .read()
+            .iter()
+            .filter(|(_, db)| idle(db, now))
+            .map(|(name, _)| name.clone())
+            .collect();
+        let mut closed = 0;
+        for ns in names {
+            let guard = self.lock(&ns).await;
+            let db = {
+                let mut open = self.open.write();
+                match open.get(&*ns) {
+                    Some(db) if idle(db, self.now_ms()) => open.remove(&*ns),
+                    _ => None,
+                }
+            };
+            let Some(db) = db else { continue };
+            let stopped = tokio::task::spawn_blocking(move || {
+                let _guard = guard;
+                db.writer.stop();
+                // the read connections close here, still under the database's lock
+                drop(db);
+            })
+            .await;
+            if stopped.is_ok() {
+                closed += 1;
+                self.idle_closed.fetch_add(1, Relaxed);
+                tracing::debug!(ns = &*ns, "database closed after being idle");
+            }
+        }
+        closed
     }
 
     pub fn open_dbs(&self) -> Vec<Arc<Db>> {
@@ -645,6 +716,114 @@ mod tests {
         assert!(!r.exists("tenant"), "the deleted database is back");
         assert!(r.open_dbs().is_empty());
         assert!(r.get("tenant").await.unwrap().is_none());
+    }
+
+    async fn insert(db: &Db, value: &str) {
+        let requests = serde_json::from_str::<crate::proto::PipelineReq>(&format!(
+            r#"{{"requests":[{{"type":"execute","stmt":{{"sql":"{value}"}}}}]}}"#
+        ))
+        .unwrap()
+        .requests;
+        let (job, rx) =
+            crate::writer::Job::new(requests, 1, false, Instant::now() + std::time::Duration::from_secs(10));
+        db.writer.submit(job);
+        assert!(matches!(rx.await.unwrap(), crate::writer::Outcome::Done { .. }));
+    }
+
+    /// `--idle-close-ms`: a database nobody uses is closed (WAL checkpointed, connections gone) and opens again on
+    /// the next request with what was written; one a request still holds, and one with a transaction left open,
+    /// stay open
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn idle_databases_are_closed_and_open_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::for_tests(dir.path());
+        cfg.idle_close_ms = 600;
+        let r = Registry::new(Arc::new(cfg));
+        for ns in ["idle", "held", "pinned"] {
+            r.create(ns, None).await.unwrap();
+            let db = r.get(ns).await.unwrap().unwrap();
+            insert(&db, "CREATE TABLE t(a)").await;
+            insert(&db, "INSERT INTO t VALUES (1)").await;
+        }
+        assert_eq!(r.close_idle().await, 0, "closed before the idle time had passed");
+        let held = r.get("held").await.unwrap().unwrap();
+        insert(&r.get("pinned").await.unwrap().unwrap(), "BEGIN").await;
+        tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+        assert_eq!(r.close_idle().await, 1);
+        let open: Vec<String> = r.open_dbs().iter().map(|d| d.name.to_string()).collect();
+        assert_eq!(open, ["held", "pinned"]);
+        // closed for good: the WAL is gone, the file is whole on its own
+        let file = r.path("idle");
+        let mut wal = file.as_os_str().to_owned();
+        wal.push("-wal");
+        assert!(
+            !Path::new(&wal).exists(),
+            "the WAL of the closed database is still there"
+        );
+        let rows: i64 = rusqlite::Connection::open(&file)
+            .unwrap()
+            .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 1);
+        // the next request opens it again
+        let db = r.get("idle").await.unwrap().unwrap();
+        insert(&db, "INSERT INTO t VALUES (2)").await;
+        assert_eq!(r.open_dbs().len(), 3);
+        drop((db, held));
+        // released and unused again: both close; the one with the open transaction (its 5 s are not up) stays
+        tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+        assert_eq!(r.close_idle().await, 2, "idle and held");
+        assert_eq!(r.idle_closed.load(Relaxed), 3);
+        assert_eq!(r.open_dbs().len(), 1);
+    }
+
+    /// Requests arriving while a database is being closed for idleness wait for the close and then get a working
+    /// database: none fails, nothing written is lost
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn requests_racing_the_idle_close_all_succeed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::for_tests(dir.path());
+        cfg.idle_close_ms = 1;
+        let r = Registry::new(Arc::new(cfg));
+        r.create("t", None).await.unwrap();
+        insert(&r.get("t").await.unwrap().unwrap(), "CREATE TABLE t(a)").await;
+        let closer = {
+            let r = r.clone();
+            tokio::spawn(async move {
+                let mut closed = 0;
+                for _ in 0..300 {
+                    closed += r.close_idle().await;
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
+                closed
+            })
+        };
+        let mut writers = Vec::new();
+        for w in 0..4 {
+            let r = r.clone();
+            writers.push(tokio::spawn(async move {
+                for i in 0..50 {
+                    let db = r.get("t").await.unwrap().unwrap();
+                    insert(&db, &format!("INSERT INTO t VALUES ({})", w * 1000 + i)).await;
+                    drop(db);
+                    tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+                }
+            }));
+        }
+        for w in writers {
+            w.await.unwrap();
+        }
+        let closed = closer.await.unwrap();
+        assert!(closed > 0, "the database was never closed: the test raced nothing");
+        let db = r.get("t").await.unwrap().unwrap();
+        drop(db);
+        let registry = r.clone();
+        tokio::task::spawn_blocking(move || registry.shutdown()).await.unwrap();
+        let rows: i64 = rusqlite::Connection::open(r.path("t"))
+            .unwrap()
+            .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 200);
     }
 
     /// Review of 0.1.0: the files of a build that crashed stayed until a database of that name was created again

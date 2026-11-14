@@ -1,7 +1,13 @@
-//! The write thread of one database: the only writer, so SQLite never answers "busy" to a client. Write requests
-//! wait in a queue; the thread takes up to `--group-max` of them, runs them inside one real transaction (each request
-//! in a savepoint, see `exec.rs`) and commits once, so many client transactions share one fsync. Replies are sent
-//! only after that COMMIT returned.
+//! The writer of one database: the only one, so SQLite never answers "busy" to a client. Write requests wait in a
+//! queue; the writer takes up to `--group-max` of them, runs them inside one real transaction (each request in a
+//! savepoint, see `exec.rs`) and commits once, so many client transactions share one fsync. Replies are sent only
+//! after that COMMIT returned.
+//!
+//! The writer has no thread of its own. It is state ([`Thread`], named for what it used to be) that runs on a worker
+//! of the shared pool (`pool.rs`) while its queue has work, one worker at a time, and gives the worker back when
+//! the queue is empty; "the write thread" below is whichever worker runs it. What it has to do later without a
+//! request arriving (the idle checkpoint, rolling back a transaction left open, answering queued requests whose
+//! time ran out) it asks the pool's timer to wake it for. An open database without work holds no thread.
 //!
 //! Requests that cannot share the group transaction run on their own ("solo"): PRAGMA, SAVEPOINT/RELEASE, VACUUM,
 //! a request that leaves its transaction open, a request during which SQLite rolled back the group, and every
@@ -9,7 +15,8 @@
 //! the thread then only runs that stream's requests, and rolls the transaction back after `--pinned-tx-timeout-ms`,
 //! when the client goes away, or on shutdown. The lock is never held by nobody.
 //!
-//! Checkpoints: once the WAL holds `--checkpoint-pages` frames the thread wakes the database's checkpoint thread,
+//! Checkpoints: once the WAL holds `--checkpoint-pages` frames the thread starts the database's checkpoint task (on
+//! another worker; "the checkpoint thread" below),
 //! which runs PASSIVE on its own connection while writes go on (SQLite lets a passive checkpoint run beside the
 //! writer). Between groups the write thread itself runs RESTART once the WAL passes `--checkpoint-restart-bytes`,
 //! and PASSIVE after `--checkpoint-idle-ms` without work; once `--checkpoint-pages` frames have been written since
@@ -23,10 +30,9 @@
 
 use std::collections::VecDeque;
 use std::path::Path;
-use std::sync::atomic::{AtomicI64, Ordering::Relaxed};
-use std::sync::mpsc::{self, RecvTimeoutError};
-use std::sync::{Arc, Condvar, Mutex};
-use std::thread::JoinHandle;
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering::Relaxed, Ordering::SeqCst};
+use std::sync::mpsc::{self, RecvTimeoutError, TryRecvError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use rusqlite::wal::CheckpointMode;
@@ -36,6 +42,7 @@ use crate::config::Config;
 use crate::conn::{Conn, REQUEST_SP};
 use crate::exec::{self, Exec, Results};
 use crate::metrics::DbMetrics;
+use crate::pool;
 use crate::proto::StreamRequest;
 use crate::reader::ReadGate;
 use crate::sql;
@@ -101,10 +108,181 @@ enum Msg {
     Stop(oneshot::Sender<()>),
 }
 
-/// Handle to the write thread
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The receiving end of a write queue. Counts what was sent and not yet taken, so that the worker that found the
+/// queue empty can tell, after giving up its turn, whether something arrived in between ([`Shared::run`]).
+struct Inbox {
+    rx: mpsc::Receiver<Msg>,
+    pending: Arc<AtomicUsize>,
+}
+
+impl Inbox {
+    fn try_recv(&self) -> Result<Msg, TryRecvError> {
+        let r = self.rx.try_recv();
+        if r.is_ok() {
+            self.pending.fetch_sub(1, SeqCst);
+        }
+        r
+    }
+
+    fn recv_timeout(&self, timeout: Duration) -> Result<Msg, RecvTimeoutError> {
+        let r = self.rx.recv_timeout(timeout);
+        if r.is_ok() {
+            self.pending.fetch_sub(1, SeqCst);
+        }
+        r
+    }
+}
+
+/// What a run of the writer ended with
+enum Next {
+    /// Nothing to do now; wake it at that time even if no request arrives
+    Idle(Option<Instant>),
+    /// Shut down; the acknowledgement is sent once the connections are closed
+    Stopped(Option<oneshot::Sender<()>>),
+}
+
+/// The writer's state and whether a worker is running it
+struct Shared {
+    /// None once stopped (the connections are closed then)
+    state: Mutex<Option<Thread>>,
+    /// A worker is running the writer, or a task to do so is queued: at most one at a time
+    scheduled: AtomicBool,
+    /// Messages sent and not yet taken off the queue
+    pending: Arc<AtomicUsize>,
+    timer: Mutex<WakeTimer>,
+    /// Tests only: milliseconds a worker waits between finding the queue empty and giving up its turn
+    #[cfg(test)]
+    linger_before_release: std::sync::atomic::AtomicU64,
+    /// Tests only: how many times a worker ran the writer
+    #[cfg(test)]
+    runs: std::sync::atomic::AtomicU64,
+}
+
+impl Shared {
+    /// Has a worker run the writer, unless one already does or is about to
+    fn wake(self: &Arc<Self>) {
+        if !self.scheduled.swap(true, SeqCst) {
+            let shared = self.clone();
+            pool::spawn(move || shared.run());
+        }
+    }
+
+    fn run(self: &Arc<Self>) {
+        loop {
+            #[cfg(test)]
+            self.runs.fetch_add(1, Relaxed);
+            let next = {
+                let mut state = lock(&self.state);
+                let next = state.as_mut().map(Thread::run_until_idle);
+                if matches!(next, Some(Next::Stopped(_))) {
+                    // closes the connections: whoever asked for the stop may remove the files once it hears back
+                    *state = None;
+                }
+                next
+            };
+            let wake = match next {
+                Some(Next::Idle(wake)) => wake,
+                Some(Next::Stopped(ack)) => {
+                    if let Some(ack) = ack {
+                        let _ = ack.send(());
+                    }
+                    self.scheduled.store(false, SeqCst);
+                    return;
+                }
+                None => {
+                    self.scheduled.store(false, SeqCst);
+                    return;
+                }
+            };
+            #[cfg(test)]
+            std::thread::sleep(Duration::from_millis(self.linger_before_release.load(Relaxed)));
+            // The turn is given up first and the queue looked at after: a message sent before this point is seen
+            // here, one sent after finds the flag clear and starts a worker itself. Whoever sets the flag runs.
+            // (A store followed by a load of something else, against the sender's add followed by a swap: only
+            // sequentially consistent ordering rules out both sides missing each other.)
+            self.scheduled.store(false, SeqCst);
+            // The timer is asked for only now. A timer that fired while this worker still held the turn found the
+            // flag set and started nothing; asked for before giving up the turn, the request could find that timer
+            // still set, be dropped as covered by it, and then lose it to exactly that: nobody would run the writer
+            // at the time it needs (a transaction left open would stay open, queued requests unanswered). From here
+            // on a timer that fires starts a worker, and one that already fired is no longer set, so a new one is.
+            self.want_wake(wake);
+            if self.pending.load(SeqCst) == 0 || self.scheduled.swap(true, SeqCst) {
+                return;
+            }
+            // counted but perhaps not sent yet (the sender is between the two): let it get there
+            std::thread::yield_now();
+        }
+    }
+
+    /// Records when the writer wants to run next without a message arriving (None: not at all) and sets a timer
+    /// for it, unless one for that time or an earlier one is already set: that one looks at what is wanted when it
+    /// fires. Timers hold no reference: a stopped writer's timers find nothing.
+    fn want_wake(self: &Arc<Self>, wake: Option<Instant>) {
+        let mut timer = lock(&self.timer);
+        timer.wanted = wake;
+        let Some(at) = wake else { return };
+        if timer.armed.is_some_and(|armed| armed <= at) {
+            return;
+        }
+        timer.armed = Some(at);
+        drop(timer);
+        self.arm(at);
+    }
+
+    fn arm(self: &Arc<Self>, at: Instant) {
+        let weak = Arc::downgrade(self);
+        pool::at(at, move || {
+            if let Some(shared) = weak.upgrade() {
+                shared.timer_fired(at);
+            }
+        });
+    }
+
+    /// On the timer thread. Runs the writer if the time it wants has come. Requests that ran since the timer was
+    /// set have moved that time (a database written to every half second wants its idle checkpoint a second after
+    /// the latest write): then the timer is set again for the new time, here, without a worker; with nothing wanted
+    /// any more it just ends.
+    fn timer_fired(self: &Arc<Self>, at: Instant) {
+        let mut timer = lock(&self.timer);
+        if timer.armed == Some(at) {
+            timer.armed = None;
+        }
+        match timer.wanted {
+            None => {}
+            Some(wanted) if wanted > Instant::now() => {
+                if !timer.armed.is_some_and(|armed| armed <= wanted) {
+                    timer.armed = Some(wanted);
+                    drop(timer);
+                    self.arm(wanted);
+                }
+            }
+            Some(_) => {
+                drop(timer);
+                self.wake();
+            }
+        }
+    }
+}
+
+/// When the writer wants to be run by a timer, and the timer set for it
+#[derive(Default)]
+struct WakeTimer {
+    /// What the last run asked for: the time the writer must run again even if no message arrives
+    wanted: Option<Instant>,
+    /// The earliest timer that is set and has not fired
+    armed: Option<Instant>,
+}
+
+/// Handle to the writer of one database
 pub struct Writer {
     tx: mpsc::Sender<Msg>,
-    thread: Mutex<Option<JoinHandle<()>>>,
+    shared: Arc<Shared>,
+    stopped: AtomicBool,
     metrics: Arc<DbMetrics>,
     max_queue: i64,
 }
@@ -119,20 +297,45 @@ impl Writer {
     ) -> anyhow::Result<Writer> {
         let (tx, rx) = mpsc::channel();
         let max_queue = cfg.max_write_queue as i64;
-        let mut w = Thread::open(path, cfg, rx, streams, metrics.clone(), gate)?;
-        let thread = std::thread::Builder::new()
-            .name("xsqld-writer".into())
-            .spawn(move || w.run())?;
+        let pending = Arc::new(AtomicUsize::new(0));
+        let inbox = Inbox {
+            rx,
+            pending: pending.clone(),
+        };
+        let w = Thread::open(path, cfg, inbox, streams, metrics.clone(), gate)?;
         Ok(Writer {
             tx,
-            thread: Mutex::new(Some(thread)),
+            shared: Arc::new(Shared {
+                state: Mutex::new(Some(w)),
+                scheduled: AtomicBool::new(false),
+                pending,
+                timer: Mutex::new(WakeTimer::default()),
+                #[cfg(test)]
+                linger_before_release: Default::default(),
+                #[cfg(test)]
+                runs: Default::default(),
+            }),
+            stopped: AtomicBool::new(false),
             metrics,
             max_queue,
         })
     }
 
+    /// Queues a message and has a worker run the writer. The count goes up before the send, so the writer never
+    /// takes a message that is not counted yet.
+    fn send(&self, msg: Msg) -> Result<(), mpsc::SendError<Msg>> {
+        self.shared.pending.fetch_add(1, SeqCst);
+        if let Err(e) = self.tx.send(msg) {
+            self.shared.pending.fetch_sub(1, SeqCst);
+            return Err(e);
+        }
+        self.shared.wake();
+        Ok(())
+    }
+
     /// Queues a job; answered at once with [`Outcome::QueueFull`] when the queue is full (the stream holding an open
-    /// transaction is still let in, it is what the queue waits for) or [`Outcome::Unavailable`] if the thread is gone
+    /// transaction is still let in, it is what the queue waits for) or [`Outcome::Unavailable`] if the writer has
+    /// stopped
     pub fn submit(&self, job: Job) {
         if self.metrics.queue_len.fetch_add(1, Relaxed) >= self.max_queue && !job.expect_pinned {
             self.metrics.queue_len.fetch_sub(1, Relaxed);
@@ -140,22 +343,44 @@ impl Writer {
             let _ = job.reply.send(Outcome::QueueFull);
             return;
         }
-        if let Err(mpsc::SendError(Msg::Job(job))) = self.tx.send(Msg::Job(job)) {
+        if let Err(mpsc::SendError(Msg::Job(job))) = self.send(Msg::Job(job)) {
             self.metrics.queue_len.fetch_sub(1, Relaxed);
             let _ = job.reply.send(Outcome::Unavailable);
         }
     }
 
-    /// Stops the thread: queued jobs are answered with [`Outcome::Unavailable`], an open transaction is rolled back,
-    /// the WAL is checkpointed into the database file. Blocks until the thread has exited.
+    /// Whether nothing is queued, running or held open (a transaction left open by a stream): the database can be
+    /// closed without anyone noticing
+    pub fn is_quiet(&self) -> bool {
+        self.metrics.queue_len.load(Relaxed) == 0
+            && self.metrics.pinned.load(Relaxed) == 0
+            && self.shared.pending.load(SeqCst) == 0
+            && !self.shared.scheduled.load(SeqCst)
+    }
+
+    /// Stops the writer: queued jobs are answered with [`Outcome::Unavailable`], an open transaction is rolled back,
+    /// the WAL is checkpointed into the database file. Blocks until its connections are closed.
     pub fn stop(&self) {
-        let (ack, done) = oneshot::channel();
-        if self.tx.send(Msg::Stop(ack)).is_ok() {
+        if let Some(done) = self.request_stop() {
             let _ = done.blocking_recv();
         }
-        if let Some(t) = self.thread.lock().unwrap_or_else(|e| e.into_inner()).take() {
-            let _ = t.join();
+    }
+
+    /// Asks for the stop without waiting for it; None if that was done before
+    fn request_stop(&self) -> Option<oneshot::Receiver<()>> {
+        if self.stopped.swap(true, SeqCst) {
+            return None;
         }
+        let (ack, done) = oneshot::channel();
+        self.send(Msg::Stop(ack)).ok().map(|()| done)
+    }
+}
+
+impl Drop for Writer {
+    /// A writer let go without [`Writer::stop`] still shuts down (rolls back, checkpoints, closes), on a worker and
+    /// without being waited for
+    fn drop(&mut self) {
+        let _ = self.request_stop();
     }
 }
 
@@ -203,7 +428,7 @@ fn checkpoint(conn: &Conn, mode: CheckpointMode, metrics: &DbMetrics) -> Option<
     }
 }
 
-/// What the write thread knows of the checkpoint thread
+/// What the write thread knows of the checkpoint task
 #[derive(Default)]
 struct CkptState {
     /// Bumped by the write thread when the WAL started over; a run that began before reports nothing
@@ -211,52 +436,81 @@ struct CkptState {
     running: bool,
     /// Frames copied into the database file by the last finished run of this generation
     done: i64,
+    /// The write thread asked for a run that has not begun (requests made while one runs fold into one more run)
+    requested: bool,
+    /// A task for this database is queued or running on a worker: at most one at a time
+    active: bool,
+    stopped: bool,
 }
 
-/// Thread running PASSIVE checkpoints of one database when the write thread asks for one
+struct CkptShared {
+    state: Mutex<CkptState>,
+    ended: Condvar,
+    /// The checkpoint connection; taken (closed) on stop
+    conn: Mutex<Option<Conn>>,
+    metrics: Arc<DbMetrics>,
+}
+
+/// PASSIVE checkpoints of one database, run on a pool worker when the write thread asks for one
 struct Checkpointer {
-    kick: mpsc::SyncSender<()>,
-    thread: JoinHandle<()>,
-    state: Arc<(Mutex<CkptState>, Condvar)>,
+    shared: Arc<CkptShared>,
 }
 
 impl Checkpointer {
-    fn start(conn: Conn, metrics: Arc<DbMetrics>) -> std::io::Result<Checkpointer> {
-        // capacity 1: requests made while a checkpoint is running fold into one more run
-        let (kick, rx) = mpsc::sync_channel::<()>(1);
-        let state = Arc::new((Mutex::new(CkptState::default()), Condvar::new()));
-        let s = state.clone();
-        let thread = std::thread::Builder::new()
-            .name("xsqld-checkpoint".into())
-            .spawn(move || {
-                let (m, ended) = &*s;
-                let lock = || m.lock().unwrap_or_else(|e| e.into_inner());
-                while rx.recv().is_ok() {
-                    let generation = {
-                        let mut st = lock();
-                        st.running = true;
-                        st.generation
-                    };
-                    let r = checkpoint(&conn, CheckpointMode::PASSIVE, &metrics);
-                    let mut st = lock();
-                    st.running = false;
-                    if let Some((_, done)) = r
-                        && st.generation == generation
-                    {
-                        st.done = done;
-                    }
-                    ended.notify_all();
-                }
-            })?;
-        Ok(Checkpointer { kick, thread, state })
+    fn start(conn: Conn, metrics: Arc<DbMetrics>) -> Checkpointer {
+        Checkpointer {
+            shared: Arc::new(CkptShared {
+                state: Mutex::new(CkptState::default()),
+                ended: Condvar::new(),
+                conn: Mutex::new(Some(conn)),
+                metrics,
+            }),
+        }
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, CkptState> {
-        self.state.0.lock().unwrap_or_else(|e| e.into_inner())
+    fn lock(&self) -> MutexGuard<'_, CkptState> {
+        lock(&self.shared.state)
     }
 
     fn request(&self) {
-        let _ = self.kick.try_send(());
+        let mut st = self.lock();
+        if st.stopped || st.requested {
+            return;
+        }
+        st.requested = true;
+        if !st.active {
+            st.active = true;
+            drop(st);
+            let shared = self.shared.clone();
+            pool::spawn(move || Self::run(&shared));
+        }
+    }
+
+    /// The task: runs checkpoints for as long as one is asked for
+    fn run(shared: &CkptShared) {
+        loop {
+            let generation = {
+                let mut st = lock(&shared.state);
+                if !st.requested || st.stopped {
+                    st.active = false;
+                    return;
+                }
+                st.requested = false;
+                st.running = true;
+                st.generation
+            };
+            let r = lock(&shared.conn)
+                .as_ref()
+                .and_then(|conn| checkpoint(conn, CheckpointMode::PASSIVE, &shared.metrics));
+            let mut st = lock(&shared.state);
+            st.running = false;
+            if let Some((_, done)) = r
+                && st.generation == generation
+            {
+                st.done = done;
+            }
+            shared.ended.notify_all();
+        }
     }
 
     /// Whether a run is going on and how far the last one got; `restarted`: the WAL started over since the last look
@@ -269,9 +523,10 @@ impl Checkpointer {
         (st.running, st.done)
     }
 
-    /// Waits for the running checkpoint to finish; returns how far it got
+    /// Waits for the running checkpoint to finish; returns how far it got. Only waits for a run that has begun, so
+    /// a worker is at it: the write thread never waits for a task that has no worker yet.
     fn wait(&self) -> i64 {
-        let st = self.state.1.wait_while(self.lock(), |s| s.running);
+        let st = self.shared.ended.wait_while(self.lock(), |s| s.running);
         st.unwrap_or_else(|e| e.into_inner()).done
     }
 
@@ -280,10 +535,17 @@ impl Checkpointer {
         self.lock().done = done;
     }
 
-    /// Waits for a running checkpoint to finish and ends the thread
+    /// Waits for a running checkpoint to finish, lets no further one begin and closes the connection
     fn stop(self) {
-        drop(self.kick);
-        let _ = self.thread.join();
+        let mut st = self.lock();
+        st.stopped = true;
+        st = self
+            .shared
+            .ended
+            .wait_while(st, |s| s.running)
+            .unwrap_or_else(|e| e.into_inner());
+        drop(st);
+        lock(&self.shared.conn).take();
     }
 }
 
@@ -298,7 +560,7 @@ fn install_wal_hook(conn: &mut Conn, frames: &Arc<AtomicI64>) -> rusqlite::Resul
 struct Thread {
     conn: Conn,
     cfg: Arc<Config>,
-    rx: mpsc::Receiver<Msg>,
+    rx: Inbox,
     streams: Arc<Streams>,
     metrics: Arc<DbMetrics>,
     /// Frames in the WAL after the last commit (set by the WAL hook)
@@ -325,13 +587,16 @@ struct Thread {
     stop: Option<oneshot::Sender<()>>,
     /// Something was committed since the last complete checkpoint
     dirty: bool,
+    /// When the last request ran (or the last idle checkpoint was tried): the idle checkpoint is due
+    /// `--checkpoint-idle-ms` after
+    idle_since: Instant,
 }
 
 impl Thread {
     fn open(
         path: &Path,
         cfg: Arc<Config>,
-        rx: mpsc::Receiver<Msg>,
+        rx: Inbox,
         streams: Arc<Streams>,
         metrics: Arc<DbMetrics>,
         gate: Arc<ReadGate>,
@@ -339,7 +604,7 @@ impl Thread {
         let mut conn = Conn::open_writer(path, &cfg)?;
         let frames = Arc::new(AtomicI64::new(0));
         install_wal_hook(&mut conn, &frames)?;
-        let checkpointer = Checkpointer::start(Conn::open_writer(path, &cfg)?, metrics.clone())?;
+        let checkpointer = Checkpointer::start(Conn::open_writer(path, &cfg)?, metrics.clone());
         let page_size = page_size(&conn)?;
         Ok(Thread {
             conn,
@@ -360,29 +625,34 @@ impl Thread {
             pinned: None,
             stop: None,
             dirty: false,
+            idle_since: Instant::now(),
         })
     }
 
-    fn run(&mut self) {
+    /// Runs what is queued, then returns: the worker is given back while there is nothing to do. `Idle` carries
+    /// the time the writer must run again even if no request arrives (the idle checkpoint, the end of a transaction
+    /// left open, the next queued request running out of time).
+    fn run_until_idle(&mut self) -> Next {
         while self.stop.is_none() {
             if self.pinned.is_some() {
-                self.pinned_step();
-                continue;
+                match self.pinned_step() {
+                    Some(wake) => return Next::Idle(Some(wake)),
+                    None => continue,
+                }
             }
             let job = match self.backlog.pop_front() {
                 Some(j) => j,
-                None => match self.idle_wait() {
+                None => match self.rx.try_recv() {
                     Ok(Msg::Job(j)) => j,
                     Ok(Msg::Stop(ack)) => {
                         self.stop = Some(ack);
                         break;
                     }
-                    Err(RecvTimeoutError::Timeout) => {
-                        self.metrics.idle_wakeups.fetch_add(1, Relaxed);
-                        self.idle_checkpoint();
-                        continue;
-                    }
-                    Err(RecvTimeoutError::Disconnected) => break,
+                    Err(TryRecvError::Empty) => match self.idle() {
+                        Some(wake) => return Next::Idle(wake),
+                        None => continue,
+                    },
+                    Err(TryRecvError::Disconnected) => break,
                 },
             };
             let Some(job) = self.admit(job) else { continue };
@@ -400,17 +670,26 @@ impl Thread {
             self.after_commit();
         }
         self.shutdown();
+        Next::Stopped(self.stop.take())
     }
 
-    /// Waits for the next message with nothing queued. Wakes up after `--checkpoint-idle-ms` only when there is
-    /// something to checkpoint; with nothing to do (all checkpointed, or `--checkpoint-idle-ms 0`: no idle
-    /// checkpoint) it sleeps until the next message, so an idle database costs no CPU.
-    fn idle_wait(&self) -> Result<Msg, RecvTimeoutError> {
-        if self.dirty && self.cfg.checkpoint_idle_ms > 0 {
-            self.rx.recv_timeout(self.cfg.checkpoint_idle())
-        } else {
-            self.rx.recv().map_err(|_| RecvTimeoutError::Disconnected)
+    /// Nothing queued. With something to checkpoint, the idle checkpoint runs once `--checkpoint-idle-ms` have
+    /// passed since the last request: `Some(Some(when))` asks to be woken then, `None` says it just ran (look at
+    /// the queue again). With nothing to do (all checkpointed, or `--checkpoint-idle-ms 0`: no idle checkpoint)
+    /// `Some(None)`: the writer sleeps until the next message, so an idle database costs no CPU and no thread.
+    fn idle(&mut self) -> Option<Option<Instant>> {
+        if !self.dirty || self.cfg.checkpoint_idle_ms == 0 {
+            return Some(None);
         }
+        let due = self.idle_since + self.cfg.checkpoint_idle();
+        if Instant::now() < due {
+            return Some(Some(due));
+        }
+        self.metrics.idle_wakeups.fetch_add(1, Relaxed);
+        self.idle_checkpoint();
+        // still dirty (the checkpoint task was at work, or a reader needs frames): the next idle period tries again
+        self.idle_since = Instant::now();
+        None
     }
 
     /// Takes a job off the queue: answers it without running when its client is gone or it waited too long
@@ -644,27 +923,41 @@ impl Thread {
         }
     }
 
-    /// Pinned: wait for the next request of the stream holding the transaction; everything else waits
-    fn pinned_step(&mut self) {
-        let Some((stream, since)) = self.pinned else { return };
+    /// Pinned: only the stream holding the transaction runs; everything else waits in the backlog. Runs that
+    /// stream's next request if it is queued (None: look again). Otherwise returns when to look again without a
+    /// message arriving: when the transaction times out, or when the next waiting request runs out of time.
+    fn pinned_step(&mut self) -> Option<Instant> {
+        let (stream, since) = self.pinned?;
         let until = since + self.cfg.pinned_tx_timeout();
         if let Some(pos) = self.backlog.iter().position(|j| j.stream == stream) {
             let job = self.backlog.remove(pos).expect("position is valid");
             self.run_pinned(job);
-            return;
+            return None;
         }
-        let wake = self.expire_backlog().map_or(until, |next| next.min(until));
-        match self.rx.recv_timeout(wake.saturating_duration_since(Instant::now())) {
-            Ok(Msg::Job(j)) if j.stream == stream => self.run_pinned(j),
-            Ok(Msg::Job(j)) => self.backlog.push_back(j),
-            Ok(Msg::Stop(ack)) => self.stop = Some(ack),
-            Err(RecvTimeoutError::Timeout) if Instant::now() >= until => {
-                self.metrics.pinned_timeouts.fetch_add(1, Relaxed);
-                self.unpin("open transaction timed out");
+        loop {
+            match self.rx.try_recv() {
+                Ok(Msg::Job(j)) if j.stream == stream => {
+                    self.run_pinned(j);
+                    return None;
+                }
+                Ok(Msg::Job(j)) => self.backlog.push_back(j),
+                Ok(Msg::Stop(ack)) => {
+                    self.stop = Some(ack);
+                    return None;
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    self.unpin("shutting down");
+                    return None;
+                }
             }
-            Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => self.unpin("shutting down"),
         }
+        if Instant::now() >= until {
+            self.metrics.pinned_timeouts.fetch_add(1, Relaxed);
+            self.unpin("open transaction timed out");
+            return None;
+        }
+        Some(self.expire_backlog().map_or(until, |next| next.min(until)))
     }
 
     /// While pinned: answers the queued jobs whose wait or deadline has run out now, as `admit` would once the
@@ -738,6 +1031,7 @@ impl Thread {
     /// each other; it only grows on while single reads run longer than the wait (each read is still cut off at its
     /// own deadline).
     fn after_commit(&mut self) {
+        self.idle_since = Instant::now();
         if self.pinned.is_some() {
             return;
         }
@@ -875,9 +1169,6 @@ impl Thread {
             c.stop();
         }
         self.truncate();
-        if let Some(ack) = self.stop.take() {
-            let _ = ack.send(());
-        }
     }
 }
 
@@ -899,6 +1190,7 @@ mod tests {
     use super::*;
     use crate::proto::{PipelineReq, StreamResult};
     use std::path::PathBuf;
+    use std::thread::JoinHandle;
 
     fn wal_path(db: &Path) -> PathBuf {
         let mut p = db.as_os_str().to_owned();
@@ -1164,6 +1456,215 @@ mod tests {
         assert_eq!(f.count(), 1, "the pinned insert was rolled back");
         let o = f.send(7, true, r#"[{"type":"execute","stmt":{"sql":"COMMIT"}}]"#);
         assert!(matches!(o, Outcome::StreamExpired));
+    }
+
+    fn holds_worker(f: &Fixture) -> bool {
+        f.writer.shared.scheduled.load(SeqCst)
+    }
+
+    /// 0.1.4: a database without work holds no worker. Not after a request (the idle checkpoint is a timer, not a
+    /// thread waiting for it), and not while a stream holds a transaction open on it (that timeout is a timer too)
+    #[test]
+    fn a_database_without_work_holds_no_worker() {
+        let f = fixture(|c| {
+            c.checkpoint_idle_ms = 100;
+            c.pinned_tx_timeout_ms = 300;
+        });
+        assert!(is_ok(&f.send(1, false, &execs(&["INSERT INTO t(b) VALUES ('x')"])), 0));
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(!holds_worker(&f), "still on a worker 30 ms after its only request");
+        assert!(
+            lock(&f.writer.shared.timer).armed.is_some(),
+            "no timer for the idle checkpoint"
+        );
+        std::thread::sleep(Duration::from_millis(250));
+        assert_eq!(
+            f.metrics.checkpoint_passive.count.load(Relaxed),
+            1,
+            "the idle checkpoint ran"
+        );
+        assert!(!holds_worker(&f));
+        assert!(
+            lock(&f.writer.shared.timer).wanted.is_none(),
+            "a timer although there is nothing left to do"
+        );
+        // a transaction left open: its stream may be back any moment or never
+        let o = f.send(7, false, &execs(&["BEGIN", "INSERT INTO t(b) VALUES ('p')"]));
+        assert!(matches!(o, Outcome::Done { pinned: true, .. }));
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(!holds_worker(&f), "waiting for the stream on a worker");
+        // its next request is run, and the transaction's time is still counted from when it was opened
+        let o = f.send(7, true, &execs(&["INSERT INTO t(b) VALUES ('q')"]));
+        assert!(matches!(o, Outcome::Done { pinned: true, .. }));
+        std::thread::sleep(Duration::from_millis(450));
+        assert_eq!(
+            f.metrics.pinned_timeouts.load(Relaxed),
+            1,
+            "the timer did not end the transaction"
+        );
+        assert!(!holds_worker(&f));
+        assert_eq!(f.count(), 1, "the open transaction was rolled back");
+        assert!(matches!(f.send(7, true, &execs(&["COMMIT"])), Outcome::StreamExpired));
+    }
+
+    /// 0.1.4: the worker gives up its turn when the queue is empty, and a request arriving at that very moment must
+    /// still be run (by that worker or a new one). Clients that each wait for their reply before sending the next
+    /// make the queue run empty all the time; a request left behind would never be answered.
+    #[test]
+    fn no_request_is_left_behind_when_the_queue_runs_empty() {
+        let f = Arc::new(fixture(|_| {}));
+        let clients: Vec<_> = (0..8u64)
+            .map(|c| {
+                let f = f.clone();
+                std::thread::spawn(move || {
+                    for i in 0..400 {
+                        let (job, rx) = f.job(c + 1, false, &execs(&["SELECT 1; "]));
+                        f.writer.submit(job);
+                        let deadline = Instant::now() + Duration::from_secs(20);
+                        let mut rx = rx;
+                        loop {
+                            match rx.try_recv() {
+                                Ok(o) => {
+                                    assert!(matches!(o, Outcome::Done { .. }), "client {c} request {i}: {o:?}");
+                                    break;
+                                }
+                                Err(oneshot::error::TryRecvError::Empty) => {
+                                    assert!(Instant::now() < deadline, "client {c} request {i} was never answered");
+                                    std::thread::yield_now();
+                                }
+                                Err(e) => panic!("client {c} request {i}: {e}"),
+                            }
+                        }
+                    }
+                })
+            })
+            .collect();
+        for c in clients {
+            c.join().unwrap();
+        }
+        assert_eq!(f.metrics.queue_len.load(Relaxed), 0);
+    }
+
+    /// The same, at exactly that moment: the second request arrives after the worker found the queue empty and
+    /// before it gave up its turn
+    #[test]
+    fn a_request_arriving_as_the_worker_leaves_is_run() {
+        // no idle checkpoint: its timer would run the writer a second later and hide a request left behind
+        let f = fixture(|c| c.checkpoint_idle_ms = 0);
+        f.writer.shared.linger_before_release.store(200, Relaxed);
+        let (job, first) = f.job(1, false, &execs(&["SELECT 1"]));
+        f.writer.submit(job);
+        assert!(matches!(first.blocking_recv().unwrap(), Outcome::Done { .. }));
+        // the worker has answered and now lingers with the queue empty, its turn not yet given up
+        assert!(holds_worker(&f));
+        let (job, mut second) = f.job(1, false, &execs(&["SELECT 2"]));
+        f.writer.submit(job);
+        f.writer.shared.linger_before_release.store(0, Relaxed);
+        let until = Instant::now() + Duration::from_secs(5);
+        loop {
+            match second.try_recv() {
+                Ok(o) => break assert!(matches!(o, Outcome::Done { .. })),
+                Err(_) => assert!(
+                    Instant::now() < until,
+                    "the request that arrived as the worker left was never run"
+                ),
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// 0.1.4: a database that keeps being written to takes a worker for its requests only. The idle checkpoint's
+    /// timer, due a while after the latest write, finds that time moved on and sets itself again without a worker
+    /// (3500 such databases were 3500 pointless tasks a second, and the bursts kept the pool at its limit).
+    #[test]
+    fn timers_of_a_busy_database_take_no_worker() {
+        let f = fixture(|c| c.checkpoint_idle_ms = 100);
+        for i in 0..20 {
+            assert!(is_ok(
+                &f.send(1, false, &execs(&[&format!("INSERT INTO t(b) VALUES ('{i}')")])),
+                0
+            ));
+            std::thread::sleep(Duration::from_millis(30));
+        }
+        let runs = f.writer.shared.runs.load(Relaxed);
+        assert!(
+            runs <= 21,
+            "{runs} runs for 20 requests over 600 ms: timers ran the writer in between"
+        );
+        assert_eq!(f.metrics.idle_wakeups.load(Relaxed), 0);
+        // left alone, the idle checkpoint still comes, once
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(f.metrics.idle_wakeups.load(Relaxed), 1);
+        assert_eq!(f.writer.shared.runs.load(Relaxed), runs + 1);
+    }
+
+    /// Review of 0.1.4: a timer that fires while a worker is still finishing its run finds the turn taken and starts
+    /// nothing. The worker had asked for its next wake-up before giving up the turn and was told that timer covered
+    /// it, so afterwards nobody ran the writer: the open transaction was never rolled back and the request waiting
+    /// behind it never answered.
+    #[test]
+    fn a_timer_firing_while_the_worker_leaves_is_not_lost() {
+        let f = fixture(|c| {
+            c.checkpoint_idle_ms = 0;
+            c.pinned_tx_timeout_ms = 300;
+        });
+        let o = f.send(7, false, &execs(&["BEGIN", "INSERT INTO t(b) VALUES ('p')"]));
+        assert!(matches!(o, Outcome::Done { pinned: true, .. }));
+        std::thread::sleep(Duration::from_millis(150));
+        // another stream's request: the worker puts it behind the transaction and leaves, slowly, so that the
+        // transaction's timer (at 300 ms) fires while it still holds the turn
+        f.writer.shared.linger_before_release.store(400, Relaxed);
+        let (job, mut waiting) = f.job(8, false, &execs(&["INSERT INTO t(b) VALUES ('q')"]));
+        f.writer.submit(job);
+        std::thread::sleep(Duration::from_millis(50));
+        f.writer.shared.linger_before_release.store(0, Relaxed);
+        let until = Instant::now() + Duration::from_secs(5);
+        loop {
+            match waiting.try_recv() {
+                Ok(o) => break assert!(is_ok(&o, 0)),
+                Err(_) => assert!(Instant::now() < until, "nobody ran the writer after its timer was lost"),
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(f.metrics.pinned_timeouts.load(Relaxed), 1);
+        assert_eq!(
+            f.count(),
+            1,
+            "the open transaction was rolled back, the waiting insert ran"
+        );
+    }
+
+    /// 0.1.4: stopping waits until the connections are closed (the files may be removed right after), a second stop
+    /// and a writer dropped without one do no harm, and requests after it are refused
+    #[test]
+    fn stop_closes_the_connections_before_it_returns() {
+        let f = fixture(|_| {});
+        assert!(is_ok(&f.send(1, false, &execs(&["INSERT INTO t(b) VALUES ('x')"])), 0));
+        assert!(wal_path(&f.path).exists());
+        f.writer.stop();
+        assert!(
+            f.writer.shared.state.try_lock().is_ok_and(|s| s.is_none()),
+            "the write state outlived the stop"
+        );
+        assert!(
+            !wal_path(&f.path).exists(),
+            "a connection is still open: SQLite removes the WAL with the last one"
+        );
+        f.writer.stop();
+        assert!(matches!(f.send(1, false, &execs(&["SELECT 1"])), Outcome::Unavailable));
+        // dropped without a stop: shuts down on a worker
+        let g = fixture(|_| {});
+        assert!(is_ok(&g.send(1, false, &execs(&["INSERT INTO t(b) VALUES ('x')"])), 0));
+        let (shared, wal) = (g.writer.shared.clone(), wal_path(&g.path));
+        let dir = g._dir;
+        drop((g.writer, g.readers));
+        let until = Instant::now() + Duration::from_secs(5);
+        while lock(&shared.state).is_some() && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(lock(&shared.state).is_none(), "a dropped writer did not shut down");
+        assert!(!wal.exists());
+        drop(dir);
     }
 
     #[test]
@@ -1734,9 +2235,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cfg = Config::for_tests(dir.path());
         let path = dir.path().join("data");
-        let c = Arc::new(
-            Checkpointer::start(Conn::open_writer(&path, &cfg).unwrap(), Arc::new(DbMetrics::default())).unwrap(),
-        );
+        let c = Arc::new(Checkpointer::start(
+            Conn::open_writer(&path, &cfg).unwrap(),
+            Arc::new(DbMetrics::default()),
+        ));
         {
             let mut st = c.lock();
             st.running = true;
@@ -1760,8 +2262,8 @@ mod tests {
         cfg.checkpoint_pages = 10;
         let (_tx, rx) = mpsc::channel();
         let mut t = thread(cfg, rx);
-        let state = t.checkpointer.as_ref().unwrap().state.clone();
-        state.0.lock().unwrap().running = true;
+        let state = t.checkpointer.as_ref().unwrap().shared.clone();
+        lock(&state.state).running = true;
         t.kicked_at = 100;
         t.last_frames = 100;
         // after_commit on another thread: a wrong decision fails the test instead of hanging it
@@ -1794,11 +2296,11 @@ mod tests {
             "did not wait with more than --checkpoint-pages frames written"
         );
         {
-            let mut st = state.0.lock().unwrap();
+            let mut st = lock(&state.state);
             st.running = false;
             st.done = 100;
         }
-        state.1.notify_all();
+        state.ended.notify_all();
         assert!(
             finished(&h, Duration::from_secs(5)),
             "still waiting after the run ended"
@@ -1817,7 +2319,10 @@ mod tests {
         Thread::open(
             &cfg.db_path.join("data"),
             Arc::new(cfg.clone()),
-            rx,
+            Inbox {
+                rx,
+                pending: Arc::new(AtomicUsize::new(usize::MAX / 2)),
+            },
             Streams::new(Duration::from_secs(60)),
             metrics.clone(),
             ReadGate::new(metrics),

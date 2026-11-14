@@ -295,7 +295,24 @@ async fn metrics(State(app): State<App>) -> Response {
     let (streams, pinned) = app.streams.counts();
     metrics::put(&mut out, "streams", "", streams);
     metrics::put(&mut out, "streams_pinned", "", pinned);
-    for db in app.open_dbs() {
+    let dbs = app.open_dbs();
+    let relaxed = std::sync::atomic::Ordering::Relaxed;
+    metrics::put(&mut out, "open_databases", "", dbs.len());
+    metrics::put(&mut out, "idle_closed_total", "", app.idle_closed.load(relaxed));
+    metrics::put(&mut out, "worker_threads", "", crate::pool::WORKERS.load(relaxed));
+    metrics::put(
+        &mut out,
+        "worker_threads_max",
+        "",
+        crate::pool::WORKERS_MAX.load(relaxed),
+    );
+    metrics::put(
+        &mut out,
+        "worker_threads_started_total",
+        "",
+        crate::pool::WORKERS_STARTED.load(relaxed),
+    );
+    for db in dbs {
         db.metrics.render(&db.name, &mut out);
     }
     ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], out).into_response()

@@ -109,6 +109,14 @@ pub struct Config {
     /// is only truncated on shutdown
     #[arg(long, default_value_t = 1_000)]
     pub checkpoint_idle_ms: u64,
+    /// A database no request has used for this long is closed: its WAL is checkpointed into the database file and
+    /// its connections are closed; the next request opens it again (0: databases stay open)
+    #[arg(long, default_value_t = 300_000)]
+    pub idle_close_ms: u64,
+    /// Most threads running the databases' writes and checkpoints at once (shared by all databases; threads are
+    /// started as work arrives and end when idle)
+    #[arg(long, default_value_t = 256)]
+    pub max_worker_threads: usize,
     /// PRAGMA journal_size_limit of the write connection
     #[arg(long, default_value_t = 64 * 1024 * 1024)]
     pub journal_size_limit: i64,
@@ -352,7 +360,7 @@ impl Config {
     /// Every numeric flag with the range it must be in. Upper bounds keep durations from overflowing the clock
     /// (`Instant + Duration` panics), counts within what a semaphore holds, and sizes and SQLite limits in a range
     /// where they still limit something (SQLite ignores a negative limit and keeps its own default)
-    fn numeric_bounds(&self) -> [(&'static str, i128, i128, i128); 35] {
+    fn numeric_bounds(&self) -> [(&'static str, i128, i128, i128); 37] {
         const HOUR_MS: i128 = 3_600_000;
         const GIB: i128 = 1 << 30;
         let n = |v: usize| v as i128;
@@ -382,6 +390,8 @@ impl Config {
                 60_000,
             ),
             ("checkpoint-idle-ms", u(self.checkpoint_idle_ms), 0, HOUR_MS),
+            ("idle-close-ms", u(self.idle_close_ms), 0, 24 * HOUR_MS),
+            ("max-worker-threads", n(self.max_worker_threads), 1, 65_536),
             ("journal-size-limit", self.journal_size_limit as i128, -1, 1024 * GIB),
             ("max-request-bytes", n(self.max_request_bytes), 1024, GIB),
             ("max-connections", n(self.max_connections), 1, 1_000_000),

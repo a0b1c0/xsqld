@@ -9,6 +9,32 @@ All notable changes to xsqld are documented in this file. The format is based on
 exposes them as `xsqld_build_info{version="…",commit="…"} 1`. Builds outside a git checkout can set
 `XSQLD_GIT_COMMIT`; without it and without git the commit reads `unknown`.
 
+## [0.1.4] - 2026-11-13
+
+Databases take threads only while they have work, and unused databases are closed. Before, every open database
+kept two threads and its connections for as long as the server ran: 3500 databases written to in turn were 7009
+threads, 9.1 GB of memory and 17,500 open files (8 vCPUs, 16 GB). Nothing to configure; sqld's command line and
+every 0.1.3 default keep working, and what clients see is unchanged.
+
+### Changed
+
+- The writer and the checkpoints of a database run on worker threads shared by all databases (README §3). A
+  database's writer takes a worker when a request arrives and gives it back when its queue is empty; it is still the
+  only writer of its database, and group commit, checkpoints and their limits are as before. What it does without a
+  request arriving (the idle checkpoint, rolling back a transaction left open, answering queued requests whose time
+  ran out) is woken by a timer instead of a thread waiting for it. The pool grows with the work up to
+  `--max-worker-threads` (default 256) and workers without work for 10 s end; `/metrics` has `xsqld_worker_threads`, `xsqld_worker_threads_max` and
+  `xsqld_worker_threads_started_total`.
+
+### Added
+
+- `--idle-close-ms` (default 300000, 0: off): a database no request has used for that long is closed, its WAL
+  checkpointed into the database file and its connections closed; the next request opens it again (about as long as
+  a first request after a start). A database is only closed while no request holds it, nothing is queued for it and
+  no stream has a transaction open on it; a request arriving during the close waits for it and gets the reopened
+  database. Per-database metrics start from zero when a database is opened again. `/metrics` has
+  `xsqld_open_databases` and `xsqld_idle_closed_total`.
+
 ## [0.1.3] - 2026-11-12
 
 Split-range parallel aggregation (README §3.1): an aggregate over a large table uses several CPU cores. Always on,
